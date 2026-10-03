@@ -1,0 +1,25 @@
+[package]
+name = "dbc-radar-bot"
+version = "0.1.0"
+edition = "2021"
+description = "Telegram bot for DBC Radar: risk & origin check for Meteora DBC launches"
+license = "MIT"
+
+[lib]
+name = "dbc_radar_bot"
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "dbc-radar-bot"
+path = "src/bin/main.rs"
+
+[dependencies]
+anyhow = "1"
+dotenvy = "0.15"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+teloxide = { version = "0.13", default-features = false, features = ["macros", "rustls", "ctrlc_handler"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

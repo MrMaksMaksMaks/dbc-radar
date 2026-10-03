@@ -6,3 +6,4 @@ trace_*.md
 risk.json
 research/
 *:Zone.Identifier
+bot_alerted.txt
