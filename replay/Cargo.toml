@@ -1,0 +1,16 @@
+[package]
+name = "dbc-replay"
+version = "0.1.0"
+edition = "2021"
+description = "Replays recorded Meteora DBC swaps through the program's own math and checks bit-exact agreement"
+license = "MIT"
+
+[dependencies]
+# Математика пула берётся прямо из кода программы DBC (тот же код, что исполняется onchain).
+# rev зафиксирован, чтобы сборка была воспроизводимой; обновляй осознанно.
+dynamic-bonding-curve = { git = "https://github.com/MeteoraAg/dynamic-bonding-curve", rev = "f552f20aa3c1c7631427c3827aeea7c58b902813", features = ["no-entrypoint"] }
+anchor-lang = "1.0.2"
+anyhow = "1"
+bytemuck = "1.21"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"

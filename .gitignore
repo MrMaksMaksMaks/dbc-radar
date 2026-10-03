@@ -1,0 +1,8 @@
+target/
+.env
+*.sqlite*
+*.csv
+trace_*.md
+risk.json
+research/
+*:Zone.Identifier
