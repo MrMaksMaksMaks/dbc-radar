@@ -40,8 +40,12 @@ fn save_alerted(path: &str, set: &HashSet<String>) {
 /// Пересчёт кэша по таймеру и оповещения о новых конфигах после каждого пересчёта.
 pub async fn run_refresher(bot: Bot, state: Arc<State>) {
     let mut alerted = load_alerted(&state.cfg.alerted_file);
+    let mut first = true;
     loop {
-        if let Err(e) = state.refresh().await {
+        // первый пересчёт уже сделан при старте, поэтому на первом круге пересчёт пропускаем
+        let res = if first { Ok(()) } else { state.refresh().await };
+        first = false;
+        if let Err(e) = res {
             tracing::warn!("refresh failed: {e:#}");
         } else if let Some(chat) = state.cfg.alert_chat.clone() {
             let cache = state.cache.read().await;

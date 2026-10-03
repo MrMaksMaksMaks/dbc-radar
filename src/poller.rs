@@ -11,8 +11,13 @@ use std::time::Duration;
 const PAGE: usize = 1000;
 const WARN_BACKLOG: usize = 5000;
 
+/// Сколько транзакций одного пула обрабатывать за круг: тяжёлый пул не должен
+/// задерживать остальные, недообработанное продолжится на следующем круге.
+const MAX_TX_PER_POOL_ROUND: usize = 300;
+
 pub async fn run(app: Arc<App>) {
     loop {
+        let started = std::time::Instant::now();
         if let Ok(n) = app.db.expire_pools(app.track_secs) {
             if n > 0 {
                 tracing::info!("stopped tracking {n} pools (window expired)");
@@ -29,7 +34,7 @@ pub async fn run(app: Arc<App>) {
             Err(e) => tracing::error!("active_pools: {e:#}"),
         }
         if let Ok((pools, active, swaps, completed)) = app.db.stats() {
-            tracing::info!(pools, active, swaps, completed, "round done");
+            tracing::info!(pools, active, swaps, completed, secs = started.elapsed().as_secs(), "round done");
         }
         tokio::time::sleep(Duration::from_secs(app.poll_interval_secs)).await;
     }
@@ -54,7 +59,7 @@ async fn poll_pool(app: &App, pool: &str, last_sig: Option<&str>) -> Result<()> 
 
     // От старых к новым; last_sig двигаем только после успешной обработки,
     // чтобы при сбое следующий проход продолжил с того же места.
-    for s in new_sigs.iter().rev() {
+    for s in new_sigs.iter().rev().take(MAX_TX_PER_POOL_ROUND) {
         if !s.failed {
             match app.rpc.get_transaction(&s.signature).await? {
                 Some(raw) => {

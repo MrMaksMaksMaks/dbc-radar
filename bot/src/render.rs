@@ -36,6 +36,11 @@ fn ago(t: Option<i64>) -> String {
     }
 }
 
+/// «1 trade», «5 trades».
+fn plural(n: u64, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
 fn short(a: &str) -> String {
     if a.len() > 12 { format!("{}…{}", &a[..4], &a[a.len() - 4..]) } else { a.to_string() }
 }
@@ -100,22 +105,35 @@ pub fn pool_card(p: &PoolInfo, r: Option<&ConfigRisk>) -> String {
     s.push_str(&format!("Token {}\n", code(&p.base_mint)));
     s.push_str(&format!("Pool {}\n", code(&p.pool)));
     s.push_str(&format!("Creator {}\n", code(&p.creator)));
+    let instant = r.map(|r| r.0.get("instant_graduation").and_then(|v| v.as_bool()).unwrap_or(false)).unwrap_or(false);
+    let age = p.created_time.map(|t| now() - t).unwrap_or(0);
+    // данные пула ещё не собраны: отслеживается, но есть только покупка создателя
+    let collecting = p.tracked && p.swaps.as_ref().map(|sw| sw.count <= 1).unwrap_or(true) && age > 300 && p.graduated_time.is_none();
     let grad = match p.graduated_time {
         Some(g) => format!("graduated {} after launch", dur(g - p.created_time.unwrap_or(g))),
+        None if instant => "graduates instantly (migration threshold ≈ 0)".into(),
+        None if !p.tracked => "graduation status not sampled".into(),
+        None if collecting => "trades are still being collected".into(),
         None => "on the bonding curve".into(),
     };
     s.push_str(&format!("{}\n\n", esc(&format!("Created {} · {}", ago(p.created_time), grad))));
 
-    if let Some(sw) = &p.swaps {
-        s.push_str(&format!("{}\n", bold("This pool")));
-        s.push_str(&format!(
-            "• {}\n• {}\n• {}\n\n",
-            esc(&format!("{} trades by {} wallets", sw.count, sw.traders)),
-            esc(&format!("creator's opening buy: {:.3} SOL", sw.creator_opening_buy_sol)),
-            esc(&format!("{} wallets sold tokens they never bought here", sw.fanout_sellers))
-        ));
-    } else if !p.tracked {
-        s.push_str(&format!("{}\n\n", italic("Trades of this pool are not sampled; the verdict comes from its config and operator.")));
+    match &p.swaps {
+        Some(_) if collecting => {
+            s.push_str(&format!("{}\n\n", italic("Trades of this pool are still being collected; the verdict comes from its config and operator.")));
+        }
+        Some(sw) => {
+            s.push_str(&format!("{}\n", bold("This pool")));
+            s.push_str(&format!(
+                "• {}\n• {}\n• {}\n\n",
+                esc(&format!("{} by {}", plural(sw.count, "trade", "trades"), plural(sw.traders, "wallet", "wallets"))),
+                esc(&format!("creator's opening buy: {:.3} SOL", sw.creator_opening_buy_sol)),
+                esc(&format!("{} sold tokens they never bought here", plural(sw.fanout_sellers, "wallet", "wallets")))
+            ));
+        }
+        None => {
+            s.push_str(&format!("{}\n\n", italic("Trades of this pool are not sampled; the verdict comes from its config and operator.")));
+        }
     }
 
     if let Some(r) = r {
@@ -243,7 +261,7 @@ pub fn start() -> String {
         bold("DBC Radar"),
         esc("Risk and origin check for Meteora DBC launches — before the first buy."),
         esc("Send a token, pool or config address (or a Solscan / DexScreener / Jupiter link)."),
-        esc("Commands: /check <address>, /stats, /how"),
+        esc("Commands: /check <address>, /latest, /stats, /how"),
         italic(DISCLAIMER)
     )
 }
@@ -267,4 +285,22 @@ pub fn how() -> String {
         esc("GREEN — no red flags")
     ));
     s
+}
+
+/// Последние рискованные запуски: (pool, base_mint, created_time, verdict).
+pub fn latest(rows: &[(String, String, Option<i64>, String)]) -> String {
+    let mut s = format!("{}\n", bold("Latest risky launches"));
+    if rows.is_empty() {
+        s.push_str(&esc("No RED or AMBER launches in the last 2 hours."));
+        return s;
+    }
+    s.push_str(&format!("{}\n\n", esc("Tap a launch to see why it was flagged.")));
+    for (_, mint, t, v) in rows {
+        s.push_str(&format!("{} {} {}\n", emoji(v), code(&short(mint)), esc(&format!("{} · {}", title(v), ago(*t)))));
+    }
+    s
+}
+
+pub fn short_addr(a: &str) -> String {
+    short(a)
 }

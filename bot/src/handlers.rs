@@ -129,6 +129,29 @@ async fn resolve(state: &State, addr: &str) -> View {
     not_found(addr)
 }
 
+/// Последние запуски с вердиктами RED / RED-LINK / AMBER за 2 часа.
+async fn latest_view(state: &State) -> View {
+    let rows = match state.db().and_then(|c| store::latest_pools(&c, 7200, 2000)) {
+        Ok(r) => r,
+        Err(e) => return err_view(e),
+    };
+    let cache = state.cache.read().await;
+    let picked: Vec<(String, String, Option<i64>, String)> = rows
+        .into_iter()
+        .filter_map(|(pool, config, mint, t)| {
+            let v = cache.by_config.get(&config)?.verdict();
+            matches!(v.as_str(), "RED" | "RED-LINK" | "AMBER").then_some((pool, mint, t, v))
+        })
+        .take(8)
+        .collect();
+    drop(cache);
+    let buttons: Vec<(String, String)> = picked
+        .iter()
+        .map(|(pool, mint, _, v)| (format!("{} {} · {}", render::emoji(v), render::short_addr(mint), v), pool.clone()))
+        .collect();
+    (render::latest(&picked), Some(kb::latest(&buttons)))
+}
+
 async fn stats_view(state: &State) -> View {
     let last24 = state.db().and_then(|c| store::pools_since(&c, now() - 86_400)).unwrap_or_default();
     let cache = state.cache.read().await;
@@ -167,6 +190,10 @@ pub async fn handle_message(bot: Bot, msg: Message, state: Arc<State>) -> Handle
             let (t, m) = stats_view(&state).await;
             send(&bot, chat, t, m).await?;
         }
+        "/latest" => {
+            let (t, m) = latest_view(&state).await;
+            send(&bot, chat, t, m).await?;
+        }
         "/check" => match store::extract_address(rest) {
             Some(addr) => check(&bot, chat, &state, &addr).await?,
             None => {
@@ -195,6 +222,7 @@ pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<State>) -> H
         "home" => (render::start(), Some(kb::home())),
         "how" => (render::how(), Some(kb::back_home())),
         "stats" => stats_view(&state).await,
+        "latest" => latest_view(&state).await,
         "p" => pool_view(&state, arg).await.unwrap_or_else(|| not_found(arg)),
         "c" => config_view(&state, arg, None).await.unwrap_or_else(|| not_found(arg)),
         "cp" | "op" => {

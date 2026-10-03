@@ -4,7 +4,8 @@
 //!   cp:<pool>   — отчёт по конфигу пула (с кнопкой «назад» к пулу)
 //!   o:<config>  — оператор (кластер)
 //!   r:<config>  — последние запуски конфига
-//!   stats | how | home
+//!   op:<pool>   — оператор пула (с кнопкой «назад» к пулу)
+//!   stats | how | home | latest
 
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
@@ -17,7 +18,17 @@ fn url(text: &str, u: String) -> Option<InlineKeyboardButton> {
 }
 
 pub fn home() -> InlineKeyboardMarkup {
-    InlineKeyboardMarkup::new(vec![vec![cb("📊 Stats", "stats".into()), cb("❓ How it works", "how".into())]])
+    InlineKeyboardMarkup::new(vec![
+        vec![cb("🚨 Latest risky launches", "latest".into())],
+        vec![cb("📊 Stats", "stats".into()), cb("❓ How it works", "how".into())],
+    ])
+}
+
+/// Список последних запусков: по кнопке на каждый, плюс обновить и меню.
+pub fn latest(items: &[(String, String)]) -> InlineKeyboardMarkup {
+    let mut rows: Vec<Vec<InlineKeyboardButton>> = items.iter().map(|(label, pool)| vec![cb(label, format!("p:{pool}"))]).collect();
+    rows.push(vec![cb("🔁 Refresh", "latest".into()), cb("« Menu", "home".into())]);
+    InlineKeyboardMarkup::new(rows)
 }
 
 pub fn back_home() -> InlineKeyboardMarkup {

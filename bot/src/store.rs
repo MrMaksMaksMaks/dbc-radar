@@ -214,6 +214,18 @@ pub fn pools_since(conn: &Connection, since: i64) -> Result<HashMap<String, u64>
     Ok(m)
 }
 
+/// Последние пулы (до `limit`) за последние `secs` секунд: (pool, config, base_mint, created_time).
+pub fn latest_pools(conn: &Connection, secs: i64, limit: usize) -> Result<Vec<(String, String, String, Option<i64>)>> {
+    let mut st = conn.prepare(
+        "SELECT pool, config, base_mint, created_time FROM pools
+         WHERE created_time >= ?1 ORDER BY created_time DESC LIMIT ?2",
+    )?;
+    let v = st
+        .query_map(params![now() - secs, limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(v)
+}
+
 /// Похоже ли на адрес Solana (base58, 32–44 символа). Возвращает первый такой фрагмент сообщения,
 /// чтобы принимать и ссылки Solscan / DexScreener / Jupiter.
 pub fn extract_address(text: &str) -> Option<String> {

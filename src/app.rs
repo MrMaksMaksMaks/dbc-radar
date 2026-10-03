@@ -49,10 +49,11 @@ impl App {
             if let DbcEvent::InitializePool(ip) = ev {
                 let tracked = self.should_track(ip);
                 if self.db.insert_pool(ip, sig, p.slot, p.block_time, tracked)? {
-                    tracing::info!(
-                        pool = %ip.pool, config = %ip.config, tracked,
-                        "new pool"
-                    );
+                    if tracked {
+                        tracing::info!(pool = %ip.pool, config = %ip.config, "new tracked pool");
+                    } else {
+                        tracing::debug!(pool = %ip.pool, config = %ip.config, "new pool (not sampled)");
+                    }
                     self.ensure_config(&ip.config).await;
                 }
             }

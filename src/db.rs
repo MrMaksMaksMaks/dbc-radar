@@ -209,7 +209,7 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let mut st = conn.prepare(
             "SELECT pool, last_sig FROM pools WHERE tracked = 1 AND done = 0
-             ORDER BY created_slot",
+             ORDER BY created_slot DESC",
         )?;
         let rows = st
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
