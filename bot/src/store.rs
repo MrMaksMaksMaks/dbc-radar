@@ -59,7 +59,7 @@ pub struct State {
 impl State {
     pub fn new(cfg: Config) -> Self {
         Self {
-            rpc: crate::onchain::Rpc::new(&cfg.rpc_url),
+            rpc: crate::onchain::Rpc::new(&cfg.rpc_url, cfg.history_rpc_url.as_deref()),
             cfg,
             cache: RwLock::new(Cache::default()),
             refresh_lock: Mutex::new(()),

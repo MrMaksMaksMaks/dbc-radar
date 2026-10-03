@@ -89,24 +89,44 @@ pub fn parse_init_event(data: &[u8]) -> Option<(String, String, String, String, 
     Some((pk(&p[0..32]), pk(&p[32..64]), pk(&p[64..96]), pk(&p[96..128]), p[128], u64_at(p, 129)?))
 }
 
+/// Результат поиска адреса через RPC.
+#[derive(Debug)]
+pub enum Lookup {
+    Found(FoundPool),
+    /// это токен, но создание его пула не найдено в доступной истории узла
+    MintWithoutHistory,
+    NotDbc,
+}
+
 pub struct Rpc {
     http: reqwest::Client,
     url: String,
+    history_url: String,
 }
 
 impl Rpc {
-    pub fn new(url: &str) -> Self {
+    pub fn new(url: &str, history_url: Option<&str>) -> Self {
         Self {
             http: reqwest::Client::builder().timeout(Duration::from_secs(20)).build().expect("http client"),
             url: url.to_string(),
+            history_url: history_url.unwrap_or(url).to_string(),
         }
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        self.call_at(&self.url, method, params).await
+    }
+
+    /// Запросы, которым нужна полная история (подписи и транзакции прошлых дней).
+    async fn call_history(&self, method: &str, params: Value) -> Result<Value> {
+        self.call_at(&self.history_url, method, params).await
+    }
+
+    async fn call_at(&self, url: &str, method: &str, params: Value) -> Result<Value> {
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
         let mut last = anyhow::anyhow!("no attempts");
         for attempt in 0..3u64 {
-            match self.http.post(&self.url).json(&body).send().await {
+            match self.http.post(url).json(&body).send().await {
                 Ok(r) if r.status().is_success() => {
                     let v: Value = r.json().await?;
                     if let Some(e) = v.get("error") {
@@ -140,7 +160,7 @@ impl Rpc {
             if let Some(b) = &before {
                 cfg["before"] = json!(b);
             }
-            let page = self.call("getSignaturesForAddress", json!([mint, cfg])).await?;
+            let page = self.call_history("getSignaturesForAddress", json!([mint, cfg])).await?;
             let arr = page.as_array().cloned().unwrap_or_default();
             if let Some(last) = arr.last() {
                 let sig = last.get("signature").and_then(Value::as_str).unwrap_or("").to_string();
@@ -155,7 +175,7 @@ impl Rpc {
         }
         let Some((sig, slot, t)) = oldest else { return Ok(None) };
         let tx = self
-            .call("getTransaction", json!([sig, {"encoding": "json", "commitment": "confirmed", "maxSupportedTransactionVersion": 1}]))
+            .call_history("getTransaction", json!([sig, {"encoding": "json", "commitment": "confirmed", "maxSupportedTransactionVersion": 1}]))
             .await?;
         if tx.is_null() {
             return Ok(None);
@@ -193,16 +213,19 @@ impl Rpc {
         Ok(None)
     }
 
-    /// Найти пул DBC по адресу пула или токена. None — это не DBC.
-    pub async fn resolve(&self, addr: &str) -> Result<Option<FoundPool>> {
-        let Some((owner, data)) = self.account(addr).await? else { return Ok(None) };
+    /// Найти пул DBC по адресу пула или токена.
+    pub async fn resolve(&self, addr: &str) -> Result<Lookup> {
+        let Some((owner, data)) = self.account(addr).await? else { return Ok(Lookup::NotDbc) };
         if owner == DBC_PROGRAM_ID {
-            return Ok(parse_pool_account(addr, &data));
+            return Ok(parse_pool_account(addr, &data).map(Lookup::Found).unwrap_or(Lookup::NotDbc));
         }
         if TOKEN_PROGRAMS.contains(&owner.as_str()) {
-            return self.pool_by_mint(addr).await;
+            return Ok(match self.pool_by_mint(addr).await? {
+                Some(p) => Lookup::Found(p),
+                None => Lookup::MintWithoutHistory,
+            });
         }
-        Ok(None)
+        Ok(Lookup::NotDbc)
     }
 }
 

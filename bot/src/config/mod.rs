@@ -9,6 +9,9 @@ pub struct Config {
     pub db_path: String,
     /// HTTP RPC для проверки адресов, которых нет в базе
     pub rpc_url: String,
+    /// узел с полной историей транзакций (например, Helius) — только для поиска пула по адресу
+    /// токена; пусто — используется RPC_URL
+    pub history_rpc_url: Option<String>,
     /// бинарник dbc-replay: из него берётся оценка всех конфигов (`risk --json`)
     pub replay_bin: String,
     /// как часто пересчитывать оценку конфигов, секунды
@@ -29,6 +32,7 @@ impl Config {
             bot_username: get("TELEGRAM_BOT_USERNAME", "DBC_Radar_bot"),
             db_path: get("DB_PATH", "dbc.sqlite"),
             rpc_url: get("RPC_URL", "https://solana-rpc.publicnode.com"),
+            history_rpc_url: env::var("HISTORY_RPC_URL").ok().filter(|v| !v.trim().is_empty()),
             replay_bin: get("REPLAY_BIN", "replay/target/release/dbc-replay"),
             refresh_secs: get("REFRESH_SECS", "300").parse().context("REFRESH_SECS")?,
             alert_chat: env::var("ALERT_CHAT").ok().filter(|v| !v.trim().is_empty()),

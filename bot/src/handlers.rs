@@ -102,7 +102,7 @@ fn in_db(state: &State, addr: &str) -> bool {
 async fn check_onchain(bot: &Bot, chat: ChatId, state: &State, addr: &str) -> HandlerResult {
     let wait = send(bot, chat, esc("🔎 Not in our index yet — looking it up on-chain…"), None).await?;
     let view = match state.rpc.resolve(addr).await {
-        Ok(Some(found)) => match crate::onchain::store_found(&state.cfg.db_path, &state.rpc, &found).await {
+        Ok(crate::onchain::Lookup::Found(found)) => match crate::onchain::store_found(&state.cfg.db_path, &state.rpc, &found).await {
             Ok(()) => {
                 if state.risk(&found.config).await.is_none() {
                     if let Err(e) = state.refresh().await {
@@ -113,7 +113,15 @@ async fn check_onchain(bot: &Bot, chat: ChatId, state: &State, addr: &str) -> Ha
             }
             Err(e) => err_view(e),
         },
-        Ok(None) => not_found(addr),
+        Ok(crate::onchain::Lookup::MintWithoutHistory) => (
+            format!(
+                "{}\n\n{}",
+                esc("This is a token, but we could not find its launch: either it was not launched on Meteora DBC, or the launch is older than the transaction history available to us."),
+                esc("If it is a DBC token, send its pool address instead — pools can be checked at any age.")
+            ),
+            Some(kb::back_home()),
+        ),
+        Ok(crate::onchain::Lookup::NotDbc) => not_found(addr),
         Err(e) => err_view(e),
     };
     edit(bot, chat, wait.id, view.0, view.1).await
