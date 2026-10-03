@@ -50,6 +50,7 @@ pub struct Cache {
 }
 
 pub struct State {
+    pub rpc: crate::onchain::Rpc,
     pub cfg: Config,
     pub cache: RwLock<Cache>,
     refresh_lock: Mutex<()>,
@@ -57,7 +58,12 @@ pub struct State {
 
 impl State {
     pub fn new(cfg: Config) -> Self {
-        Self { cfg, cache: RwLock::new(Cache::default()), refresh_lock: Mutex::new(()) }
+        Self {
+            rpc: crate::onchain::Rpc::new(&cfg.rpc_url),
+            cfg,
+            cache: RwLock::new(Cache::default()),
+            refresh_lock: Mutex::new(()),
+        }
     }
 
     pub fn db(&self) -> Result<Connection> {

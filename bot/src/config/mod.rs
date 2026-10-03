@@ -5,8 +5,10 @@ use std::env;
 pub struct Config {
     pub telegram_token: String,
     pub bot_username: String,
-    /// база сборщика (только чтение)
+    /// база сборщика (бот читает её и дописывает пулы, найденные по запросу через RPC)
     pub db_path: String,
+    /// HTTP RPC для проверки адресов, которых нет в базе
+    pub rpc_url: String,
     /// бинарник dbc-replay: из него берётся оценка всех конфигов (`risk --json`)
     pub replay_bin: String,
     /// как часто пересчитывать оценку конфигов, секунды
@@ -26,6 +28,7 @@ impl Config {
             telegram_token: env::var("TELEGRAM_BOT_TOKEN").context("TELEGRAM_BOT_TOKEN must be set")?,
             bot_username: get("TELEGRAM_BOT_USERNAME", "DBC_Radar_bot"),
             db_path: get("DB_PATH", "dbc.sqlite"),
+            rpc_url: get("RPC_URL", "https://solana-rpc.publicnode.com"),
             replay_bin: get("REPLAY_BIN", "replay/target/release/dbc-replay"),
             refresh_secs: get("REFRESH_SECS", "300").parse().context("REFRESH_SECS")?,
             alert_chat: env::var("ALERT_CHAT").ok().filter(|v| !v.trim().is_empty()),

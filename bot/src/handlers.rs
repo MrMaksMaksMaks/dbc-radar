@@ -85,11 +85,38 @@ fn not_found(addr: &str) -> View {
     (
         format!(
             "{}\n\n{}",
-            esc(&format!("{addr} is not a DBC pool, token or config we have seen.")),
-            esc("We index new Meteora DBC launches since October 2026. If the pool was created seconds ago, try again shortly.")
+            esc(&format!("{addr} is not a Meteora DBC pool, token or config.")),
+            esc("Send the address of a token launched on Meteora's Dynamic Bonding Curve, its pool, or its config.")
         ),
         Some(kb::back_home()),
     )
+}
+
+/// Есть ли адрес в базе сборщика (как пул, токен или конфиг).
+fn in_db(state: &State, addr: &str) -> bool {
+    let Ok(conn) = state.db() else { return false };
+    matches!(store::find_pool(&conn, addr), Ok(Some(_))) || matches!(store::config_exists(&conn, addr), Ok(true))
+}
+
+/// Адреса нет в базе: ищем пул через RPC, дописываем в базу и оцениваем.
+async fn check_onchain(bot: &Bot, chat: ChatId, state: &State, addr: &str) -> HandlerResult {
+    let wait = send(bot, chat, esc("🔎 Not in our index yet — looking it up on-chain…"), None).await?;
+    let view = match state.rpc.resolve(addr).await {
+        Ok(Some(found)) => match crate::onchain::store_found(&state.cfg.db_path, &state.rpc, &found).await {
+            Ok(()) => {
+                if state.risk(&found.config).await.is_none() {
+                    if let Err(e) = state.refresh().await {
+                        tracing::warn!("refresh failed: {e:#}");
+                    }
+                }
+                pool_view(state, &found.pool).await.unwrap_or_else(|| not_found(addr))
+            }
+            Err(e) => err_view(e),
+        },
+        Ok(None) => not_found(addr),
+        Err(e) => err_view(e),
+    };
+    edit(bot, chat, wait.id, view.0, view.1).await
 }
 
 /// Нужно ли пересчитать кэш, чтобы ответить про этот адрес (новый конфиг ещё не оценён).
@@ -107,6 +134,9 @@ async fn needs_refresh(state: &State, addr: &str) -> bool {
 
 /// Проверка адреса: пул/токен, иначе конфиг, иначе «не найдено».
 async fn check(bot: &Bot, chat: ChatId, state: &State, addr: &str) -> HandlerResult {
+    if !in_db(state, addr) {
+        return check_onchain(bot, chat, state, addr).await;
+    }
     if needs_refresh(state, addr).await {
         let wait = send(bot, chat, esc("⏳ New config — analysing, this takes a moment…"), None).await?;
         if let Err(e) = state.refresh().await {
