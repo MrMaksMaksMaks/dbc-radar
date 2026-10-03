@@ -186,6 +186,22 @@ impl Db {
         Ok(())
     }
 
+    pub fn swap_count(&self, pool: &str) -> Result<i64> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM swaps WHERE pool = ?1", params![pool], |r| r.get(0))?)
+    }
+
+    pub fn mark_done(&self, pool: &str, reason: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE pools SET done = 1, done_reason = ?2 WHERE pool = ?1",
+            params![pool, reason],
+        )?;
+        Ok(())
+    }
+
     pub fn set_last_sig(&self, pool: &str, sig: &str) -> Result<()> {
         self.conn
             .lock()

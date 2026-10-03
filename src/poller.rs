@@ -2,6 +2,7 @@
 //! начиная с последней обработанной, и разбираем новые транзакции от старых к новым.
 
 use crate::app::App;
+use futures_util::StreamExt;
 use crate::rpc::SigInfo;
 use crate::tx::parse_tx;
 use anyhow::Result;
@@ -13,7 +14,11 @@ const WARN_BACKLOG: usize = 5000;
 
 /// Сколько транзакций одного пула обрабатывать за круг: тяжёлый пул не должен
 /// задерживать остальные, недообработанное продолжится на следующем круге.
-const MAX_TX_PER_POOL_ROUND: usize = 300;
+const MAX_TX_PER_POOL_ROUND: usize = 150;
+/// Сколько транзакций запрашивать одновременно.
+const FETCH_CONCURRENCY: usize = 8;
+/// После стольких записанных свопов пул больше не опрашивается.
+const MAX_SWAPS_PER_POOL: i64 = 500;
 
 pub async fn run(app: Arc<App>) {
     loop {
@@ -57,22 +62,38 @@ async fn poll_pool(app: &App, pool: &str, last_sig: Option<&str>) -> Result<()> 
         tracing::warn!(%pool, n = new_sigs.len(), "large backlog for pool");
     }
 
-    // От старых к новым; last_sig двигаем только после успешной обработки,
-    // чтобы при сбое следующий проход продолжил с того же места.
-    for s in new_sigs.iter().rev().take(MAX_TX_PER_POOL_ROUND) {
-        if !s.failed {
-            match app.rpc.get_transaction(&s.signature).await? {
-                Some(raw) => {
-                    let parsed = parse_tx(&raw)?;
-                    app.ingest(&s.signature, &parsed).await?;
-                }
-                None => {
-                    tracing::debug!(%pool, sig = %s.signature, "tx not yet available, retry next round");
-                    return Ok(());
-                }
+    // Транзакции забираем параллельно (до FETCH_CONCURRENCY запросов сразу; общий лимит
+    // RPC_RPS соблюдается ограничителем в Rpc), а записываем строго от старых к новым:
+    // `buffered` сохраняет порядок. last_sig двигаем только после успешной обработки,
+    // поэтому при сбое следующий круг продолжит с того же места.
+    let batch: Vec<&SigInfo> = new_sigs.iter().rev().take(MAX_TX_PER_POOL_ROUND).collect();
+    let futs: Vec<_> = batch.iter().map(|s| fetch_tx(&app.rpc, s.signature.clone(), s.failed)).collect();
+    let mut fetched = futures_util::stream::iter(futs).buffered(FETCH_CONCURRENCY);
+
+    let mut i = 0;
+    while let Some(res) = fetched.next().await {
+        let s = batch[i];
+        i += 1;
+        match res? {
+            // неуспешная транзакция: событий нет, просто сдвигаем курсор
+            None => {}
+            Some(Some(raw)) => {
+                let parsed = parse_tx(&raw)?;
+                app.ingest(&s.signature, &parsed).await?;
+            }
+            Some(None) => {
+                tracing::debug!(%pool, sig = %s.signature, "tx not yet available, retry next round");
+                return Ok(());
             }
         }
         app.db.set_last_sig(pool, &s.signature)?;
+    }
+
+    // Для наших признаков нужен этап кривой; пулы, которые торгуются часами без graduation,
+    // не должны съедать лимит RPC.
+    if app.db.swap_count(pool)? >= MAX_SWAPS_PER_POOL {
+        app.db.mark_done(pool, "swap_cap")?;
+        tracing::debug!(%pool, "stopped tracking: swap cap reached");
     }
     Ok(())
 }
@@ -115,4 +136,12 @@ async fn collect_without_until(app: &App, pool: &str, last_sig: &str) -> Result<
         }
     }
     Ok(out)
+}
+
+/// None — транзакция неуспешна (событий нет); Some(None) — RPC её ещё не отдаёт.
+async fn fetch_tx(rpc: &crate::rpc::Rpc, sig: String, failed: bool) -> Result<Option<Option<serde_json::Value>>> {
+    if failed {
+        return Ok(None);
+    }
+    rpc.get_transaction(&sig).await.map(Some)
 }
