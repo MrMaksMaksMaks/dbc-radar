@@ -22,6 +22,13 @@ pub struct Config {
     pub digest_secs: u64,
     /// файл со списком конфигов, о которых уже было оповещение
     pub alerted_file: String,
+    /// адрес HTTP API (например 127.0.0.1:8080); пусто — API выключен
+    pub api_bind: Option<String>,
+    /// ключи API: с ключом разрешён поиск неизвестных адресов через RPC и выше лимит
+    pub api_keys: Vec<String>,
+    /// запросов в минуту с одного IP без ключа / с ключом
+    pub api_rate_public: u32,
+    pub api_rate_key: u32,
 }
 
 impl Config {
@@ -38,6 +45,10 @@ impl Config {
             alert_chat: env::var("ALERT_CHAT").ok().filter(|v| !v.trim().is_empty()),
             digest_secs: get("DIGEST_SECS", "21600").parse().context("DIGEST_SECS")?,
             alerted_file: get("ALERTED_FILE", "bot_alerted.txt"),
+            api_bind: env::var("API_BIND").ok().filter(|v| !v.trim().is_empty()),
+            api_keys: get("API_KEYS", "").split(',').map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned).collect(),
+            api_rate_public: get("API_RATE_PUBLIC", "30").parse().context("API_RATE_PUBLIC")?,
+            api_rate_key: get("API_RATE_KEY", "300").parse().context("API_RATE_KEY")?,
         })
     }
 }

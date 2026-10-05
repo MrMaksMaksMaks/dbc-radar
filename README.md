@@ -48,7 +48,7 @@ dbc-radar-bot ─► Telegram: checks, latest risky launches, stats, alerts
 |---|---|---|
 | Collector | `src/` | discovers DBC pools, decodes swap / graduation events, stores config accounts, builds per-pool evidence reports |
 | Engine | `replay/` | risk scoring, farm detection, operator clusters, parameter templates, activity reports, replay and counterfactuals |
-| Bot | `bot/` | Telegram interface on top of the engine, with on-chain lookup for anything not in the database |
+| Bot + API | `bot/` | Telegram interface and public JSON API on top of the engine, with on-chain lookup for anything not in the database |
 
 ## How the verdict is made
 
@@ -77,6 +77,36 @@ Send a token, pool or config address — or a Solscan, DexScreener, Jupiter or M
 - **Other launchpads.** Tokens from pump.fun, Raydium LaunchLab or Moonshot are recognised and the bot says so.
 - **Commands:** `/start`, `/check <address>`, `/latest` (latest RED / AMBER launches), `/stats`, `/how`.
 - **Alerts (optional):** posts new RED / RED-LINK / AMBER configs and a periodic digest to a channel.
+
+## Public API
+
+The bot process also serves a JSON API with the same verdicts, for terminals, bots and launchpads.
+
+| Endpoint | Returns |
+|---|---|
+| `GET /v1/check/{address}` | verdict for a token, DBC pool, config, or Meteora DAMM v2 / DLMM pool (resolved to its token) |
+| `GET /v1/latest?hours=2&limit=20` | latest RED / RED-LINK / AMBER launches |
+| `GET /v1/stats` | launches in the last 24 hours by verdict |
+| `GET /v1/health` | service status and analysis age |
+
+```bash
+curl https://<api-host>/v1/check/<token-or-pool-address>
+```
+
+```json
+{
+  "kind": "launch",
+  "verdict": "RED",
+  "launch": { "pool": "…", "token": "…", "creator": "…", "config": "…",
+              "created_time": 1790000000, "graduated_time": 1790000072,
+              "trades": { "count": 312, "wallets": 118, "creator_opening_buy_sol": 8.057, "fan_out_sellers": 21 } },
+  "config": { "verdict": "RED", "capability": 60, "evidence": 100,
+              "creator_unlocked_lp_pct": 89, "leftover_to_receiver_pct": 90.0,
+              "capability_flags": [ … ], "evidence_flags": [ … ], "cluster": 12, "cluster_size": 1 }
+}
+```
+
+Addresses already in the index are served to everyone. Looking up an unknown address on-chain spends RPC quota, so it requires a key (`X-API-Key` header). Requests are rate-limited per IP (`API_RATE_PUBLIC`, `API_RATE_KEY`).
 
 ## Running it
 
@@ -131,6 +161,9 @@ Per-pool evidence report (opening buy, where sellers' tokens came from, sells ba
 | `REFRESH_SECS` | bot | how often verdicts are recomputed (default 300) |
 | `HISTORY_RPC_URL` | bot | RPC with full transaction history, only for finding the pool of an older token |
 | `ALERT_CHAT`, `DIGEST_SECS` | bot | alert channel (`@name` or id) and digest period |
+| `API_BIND` | bot | API listen address, e.g. `127.0.0.1:8080` (empty = off) |
+| `API_KEYS` | bot | comma-separated API keys (enable on-chain lookups, higher limit) |
+| `API_RATE_PUBLIC`, `API_RATE_KEY` | bot | requests per minute per IP without / with a key |
 
 ## Validation
 
@@ -147,7 +180,7 @@ Per-pool evidence report (opening buy, where sellers' tokens came from, sells ba
 
 ## Roadmap
 
-- Public API for terminals, bots and launchpads (`/check`, `/latest`, `/stats` as JSON).
+- A streaming feed of new risky launches for terminals (websocket / webhooks).
 - Decoding DAMM v2 events to confirm liquidity withdrawal automatically.
 - A "clean config" attestation that honest launchpads can show their users.
 

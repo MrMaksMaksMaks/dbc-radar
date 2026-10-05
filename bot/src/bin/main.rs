@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use dbc_radar_bot::{alerts, config::Config, handlers, store::State};
+use dbc_radar_bot::{alerts, api, config::Config, handlers, store::State};
 use teloxide::prelude::*;
 
 #[tokio::main]
@@ -22,6 +22,7 @@ async fn main() -> Result<()> {
     }
     tokio::spawn(alerts::run_refresher(bot.clone(), state.clone()));
     tokio::spawn(alerts::run_digest(bot.clone(), state.clone()));
+    tokio::spawn(api::serve(state.clone()));
 
     let handler = dptree::entry()
         .branch(Update::filter_message().endpoint(handlers::handle_message))
