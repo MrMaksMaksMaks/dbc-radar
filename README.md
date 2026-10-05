@@ -1,292 +1,156 @@
-# dbc-collector
+# DBC Radar
 
-Сборщик данных Meteora Dynamic Bonding Curve (DBC) с Solana mainnet в SQLite:
-обнаруживает новые пулы, отбирает часть из них, собирает и декодирует их свопы.
+**Risk and origin check for Meteora DBC launches — before the first buy.**
 
-Декодирование сделано по IDL `dynamic_bonding_curve` v0.2.1 (event CPI:
-`EvtInitializePool`, `EvtSwap2`, `EvtCurveComplete` и их `WithTransferHook`-варианты).
+Anyone can launch a token on Meteora's Dynamic Bonding Curve (DBC) under their own *config*: the rules for who gets the liquidity after graduation, how much of it is locked, and how much supply goes to a "leftover receiver". Buyers never see those rules. They see a token with volume that "graduated" to a Meteora pool.
 
-## Запуск
+DBC Radar reads the rules from chain, watches what happens in the pools and answers two questions about any launch:
+
+1. **What does this config allow the creator to do after graduation?**
+2. **Who is behind the launch, and is the trading real?**
+
+It is available as a Telegram bot: [@DBC_Radar_bot](https://t.me/DBC_Radar_bot).
+
+## What we see on mainnet
+
+Over 24 hours (October 2026) the collector recorded about **6,000 DBC launches**:
+
+| Verdict | Meaning | Share of launches |
+|---|---|---|
+| 🔴 **RED** | synthetic launches: trading is dominated by the creator and wallets linked to it | ~33% |
+| 🔴 **RED-LINK** | linked by addresses to a synthetic-launch operator | ~1% |
+| 🟠 **AMBER** | the config allows pulling liquidity and dumping leftover supply; no abuse observed yet | <1% |
+| ⚪ **SELF-GRAD** | instant or self-funded graduation, no real market on the curve | ~32% |
+| 🟢 **GREEN** | no red flags in the config or in observed trading | ~34% |
+
+- In the pools of RED operators, **98% of the volume traded on the bonding curve came from the creator and linked wallets**.
+- One operator ran **1,400+ launches through a single config**. Several unrelated operators run the same playbook: farms of about **200 wallets**, tokens fanned out from the creator in identical amounts and sold back in one trade, graduation in about **70 seconds**, liquidity withdrawn right after.
+- All of this is visible from the config account and the first trades — **before tools that need trading history** can see it.
+
+Operator addresses are intentionally not published here.
+
+## Architecture
+
+```
+Solana mainnet
+   │  logsSubscribe from several websocket sources + direct polling of watched operators
+   ▼
+dbc-collector ─► SQLite: pools, decoded DBC swap events, graduations, config accounts
+   │
+   ▼
+dbc-replay  ─► risk, operator clusters, templates, activity reports, bit-exact replay
+   │  risk --json
+   ▼
+dbc-radar-bot ─► Telegram: checks, latest risky launches, stats, alerts
+```
+
+| Component | Path | What it does |
+|---|---|---|
+| Collector | `src/` | discovers DBC pools, decodes swap / graduation events, stores config accounts, builds per-pool evidence reports |
+| Engine | `replay/` | risk scoring, farm detection, operator clusters, parameter templates, activity reports, replay and counterfactuals |
+| Bot | `bot/` | Telegram interface on top of the engine, with on-chain lookup for anything not in the database |
+
+## How the verdict is made
+
+Two independent axes, so "what the config allows" is never confused with "what actually happened".
+
+**Capability** — read from the config account, known before the first buy:
+- share of post-migration liquidity the creator or partner can withdraw at once, and how long vesting lasts;
+- share of supply sent to the leftover receiver, and whether that receiver is a launchpad platform address (shared by many configs) or the operator's own;
+- migration fee, mint authority, transfer hooks, instant graduation (migration threshold ≈ 0).
+
+**Evidence** — observed in tracked pools:
+- **linked volume**: share of curve volume from the creator, fan-out sellers and the operator's wallet farm;
+- **fan-out**: wallets that sell tokens they never bought in the pool;
+- **wallet farm**: wallets that trade in at least 30% of a config's pools and have at least 80% of their activity there (this separates a farm from generic bots that buy every new token);
+- **constant first buyers**, **identical opening buys**, **launch-to-migration time**, single-creator configs.
+
+Weights were calibrated on real configs: Meteora's default Invent template and launchpads that lock all liquidity come out GREEN.
+
+**Operators and templates.** A *template* is a fingerprint of all economic config fields except addresses. An *operator cluster* links configs that share a creator, fee claimer, leftover receiver or at least three fan-out wallets. A new config of a known operator gets **RED-LINK** before it has a single trade.
+
+## Telegram bot
+
+Send a token, pool or config address — or a Solscan, DexScreener, Jupiter or Meteora link — and get the verdict with its reasons. Buttons open the config report, the operator cluster and the config's recent launches.
+
+- **Anything, not only what the collector saw.** Unknown addresses are resolved on-chain: a DBC pool account gives its config and creator; a token's earliest transaction is its pool creation; Meteora DAMM v2 and DLMM pool addresses are resolved to their token. The result is added to the database and scored.
+- **Other launchpads.** Tokens from pump.fun, Raydium LaunchLab or Moonshot are recognised and the bot says so.
+- **Commands:** `/start`, `/check <address>`, `/latest` (latest RED / AMBER launches), `/stats`, `/how`.
+- **Alerts (optional):** posts new RED / RED-LINK / AMBER configs and a periodic digest to a channel.
+
+## Running it
+
+Requires Rust ≥ 1.91 and SQLite. Build and run everything from the repository root, where `.env` and the database live.
 
 ```bash
-cp .env.example .env      # укажи RPC_URL / WS_URL своего провайдера
-cargo build --release
+git clone https://github.com/MrMaksMaksMaks/dbc-radar.git && cd dbc-radar
+cp .env.example .env                                   # fill in RPC / websocket URLs and the bot token
+cargo build --release                                  # collector
+(cd replay && cargo build --release)                   # engine (first build pulls the DBC program crate)
+(cd bot && cargo build --release)                      # bot
+
+./target/release/dbc-collector                         # keep running (systemd recommended)
+./bot/target/release/dbc-radar-bot                     # keep running
 ```
 
-**Сначала проверь декодирование на реальной транзакции** (любой своп DBC с Solscan):
-
-```bash
-./target/release/dbc-collector decode <signature>
-```
-
-Должны напечататься события `Swap2` с осмысленными суммами. Если событий нет
-или суммы странные — раскладка событий изменилась, сверь `src/events.rs` с актуальным IDL.
-
-Затем запуск сборщика (лучше на VPS, чтобы работал круглосуточно):
-
-```bash
-./target/release/dbc-collector
-```
-
-## Как работает
-
-1. `discovery::run_ws` — `logsSubscribe` на программу DBC, ловит логи `InitializeVirtualPool*`.
-2. `discovery::run_worker` — забирает транзакцию создания, пишет пул, решает, отслеживать ли его
-   (каждый `SAMPLE_EVERY`-й пул или конфиг из `CONFIG_ALLOWLIST`), один раз сохраняет сырые
-   данные конфига. Свопы из транзакции создания (первая покупка создателя) тоже сохраняются.
-3. `poller::run` — по кругу: `getSignaturesForAddress(pool, until = last_sig)` → `getTransaction`
-   → декодирование → запись. Пул перестаёт отслеживаться после `EvtCurveComplete` или через `TRACK_HOURS`.
-
-## Таблицы
-
-- `pools` — все обнаруженные пулы (и отслеживаемые, и нет) — полезно для подсчёта запусков по конфигам.
-- `swaps` — свопы отслеживаемых пулов. `trade_direction`: 1 = покупка, 0 = продажа. `next_sqrt_price` — TEXT (u128).
-- `curve_complete` — graduation.
-- `configs` — сырые данные `PoolConfig` + `quote_mint`, `fee_claimer`.
-
-## Примеры запросов
-
-```sql
--- Сколько пулов и graduation по конфигам
-SELECT p.config, c.quote_mint, COUNT(*) pools, COUNT(cc.pool) graduated
-FROM pools p LEFT JOIN configs c USING(config) LEFT JOIN curve_complete cc USING(pool)
-WHERE p.tracked = 1 GROUP BY p.config ORDER BY pools DESC;
-
--- Первые 30 секунд жизни пула: кто покупал
-SELECT s.pool, s.fee_payer, COUNT(*) buys, SUM(s.output_amount) base_bought
-FROM swaps s JOIN pools p USING(pool)
-WHERE s.trade_direction = 1 AND s.block_time - p.created_time <= 30
-GROUP BY s.pool, s.fee_payer ORDER BY s.pool, base_bought DESC;
-```
-
-## Известные ограничения
-
-- Пулы, созданные во время обрыва websocket, пропускаются.
-- `fee_payer` — первый подписант транзакции; при оплате через релейер это не всегда владелец средств.
-- Порядок свопов внутри одного слота точно не восстанавливается (есть `slot`, `event_timestamp`, `event_index`).
-- `graduated` считается только для отслеживаемых пулов.
-- Опрос последовательный: при большом числе активных пулов увеличь `RPC_RPS` (если позволяет тариф)
-  или `SAMPLE_EVERY`.
-
-## dbc-replay: проверка движка симуляции
-
-Отдельный крейт в `replay/`. Использует математику пула прямо из кода программы DBC
-(git-зависимость `dynamic-bonding-curve`, rev зафиксирован), повторяя порядок действий
-инструкции swap: `update_pre_swap` → `get_swap_result_*` → `apply_swap_result`.
+### Engine commands
 
 ```bash
 cd replay
-cargo build --release          # первая сборка долгая: тянет anchor и код программы
-./target/release/dbc-replay ../dbc.sqlite 28VR
+./target/release/dbc-replay ../dbc.sqlite risk                   # all configs, grouped by verdict
+./target/release/dbc-replay ../dbc.sqlite risk <config-prefix>   # full report for one config
+./target/release/dbc-replay ../dbc.sqlite risk --json            # machine-readable (used by the bot)
+./target/release/dbc-replay ../dbc.sqlite clusters [<prefix>]    # operator clusters
+./target/release/dbc-replay ../dbc.sqlite templates              # parameter templates shared by several configs
+./target/release/dbc-replay ../dbc.sqlite impact [--since-hours N]   # linked vs external activity per RED operator
+./target/release/dbc-replay ../dbc.sqlite <pool-prefix> [--cf]   # bit-exact replay of a pool, optional counterfactual fees
 ```
 
-Для каждой сделки печатается `OK` (симуляция совпала с EvtSwap2 до последней единицы)
-или список расхождений. Порядок сделок внутри одного слота восстанавливается
-подбором; после каждой сделки состояние синхронизируется по записанному результату.
-
-Пока поддержаны только обычные конфиги (`PoolConfig`), не transfer-hook.
-
-### Контрфактический режим
-
-Те же сделки при другом планировщике комиссий DBC:
+Per-pool evidence report (opening buy, where sellers' tokens came from, sells back into the pool, graduation, exit), with Solscan links:
 
 ```bash
-./target/release/dbc-replay ../dbc.sqlite 28VR --cf
-./target/release/dbc-replay ../dbc.sqlite 28VR --cf-mode exp --cf-start 50 --cf-end 0.25 \
-    --cf-periods 20 --cf-period-len 1 --early 10
+./target/release/dbc-collector trace <pool-prefix> [--csv solscan_defi_export.csv] > trace.md
 ```
 
-| флаг | смысл | по умолчанию |
+### Configuration (`.env`)
+
+| Variable | Used by | Meaning |
 |---|---|---|
-| `--cf-mode` | `exp` или `linear` | `exp` |
-| `--cf-start` | стартовая комиссия, % | 50 |
-| `--cf-end` | конечная комиссия, % | минимальная комиссия исходного конфига |
-| `--cf-periods` | число периодов снижения | 20 |
-| `--cf-period-len` | длина периода, в слотах или секундах (как `activation_type` конфига) | 1 |
-| `--early` | «ранние» кошельки: первая сделка не позже N слотов/секунд от активации | 10 |
-| `--verbose` | печатать таблицу проверки | — |
+| `RPC_URL` | collector, bot | HTTP RPC endpoint |
+| `WS_URLS` | collector | comma-separated websocket endpoints for pool discovery |
+| `WS_STALL_SECS` | collector | reconnect a source that is silent this long (default 20) |
+| `WATCH_ADDRESSES` | collector | operator addresses polled directly; their pools are always tracked |
+| `SAMPLE_EVERY` | collector | track every N-th new pool (1 = all) |
+| `CONFIG_ALLOWLIST` | collector | configs whose pools are always tracked |
+| `TRACK_HOURS` | collector | how long to collect swaps for each pool |
+| `RPC_RPS` | collector | HTTP request rate limit |
+| `DB_PATH` | all | SQLite database (default `dbc.sqlite`) |
+| `TELEGRAM_BOT_TOKEN` | bot | token from @BotFather |
+| `TELEGRAM_BOT_USERNAME` | bot | used for links from the alert channel |
+| `REPLAY_BIN` | bot | path to `dbc-replay` (default `replay/target/release/dbc-replay`) |
+| `REFRESH_SECS` | bot | how often verdicts are recomputed (default 300) |
+| `HISTORY_RPC_URL` | bot | RPC with full transaction history, only for finding the pool of an older token |
+| `ALERT_CHAT`, `DIGEST_SECS` | bot | alert channel (`@name` or id) and digest period |
 
-Контрфактический конфиг проверяется правилами программы (минимум 0,25%, максимум 99%).
+## Validation
 
-Модель трейдеров (статический повтор): покупки повторяются теми же суммами; продажа —
-той же *долей* позиции кошелька, что и в реальности; если кошелёк продаёт токены,
-полученные не в этом пуле, продажа повторяется как есть (помечается). Реакцию трейдеров
-на другие комиссии модель не учитывает: результат — оценка, а не прогноз.
+- The replay engine uses the DBC program crate itself (`update_pre_swap → get_swap_result_* → apply_swap_result`) and matched **741 of 741** recorded swaps of a real pool to the lamport, including the order of transactions within a slot.
+- Evidence reports traced **173 of 173** fan-out sellers in six launches of one operator directly to the creator's transfers, each of the same size.
+- The collector's discovery coverage is measured continuously against operators whose launches are polled directly.
 
-## Оценка риска конфига
+## Limitations
 
-```bash
-./target/release/dbc-replay ../dbc.sqlite risk                 # все конфиги, по степени риска
-./target/release/dbc-replay ../dbc.sqlite risk 2toDx           # подробно по одному конфигу
-./target/release/dbc-replay ../dbc.sqlite risk --json > risk.json   # для веб-страницы
-```
+- Trading evidence comes from sampled pools; config capability is computed for every config.
+- An operator that uses fresh wallets for every launch would weaken the farm signals; config capability and address links still apply.
+- Post-migration liquidity withdrawal is confirmed through transaction traces, not yet through decoded DAMM v2 events.
+- Verdicts are heuristic analysis of public on-chain data, not financial advice.
 
-Две оси вместо одного числа:
+## Roadmap
 
-* **capability** — что конфиг *позволяет* сделать (только аккаунт конфига, известно до первой покупки):
-  связка «создатель получает ≥50% ликвидности после миграции без блокировки + ≥20% supply уходит
-  leftover receiver» (+55), каждое из этих условий отдельно (+20), незаблокированная ликвидность
-  партнёра ≥40% (+10), короткий вестинг (+5), комиссия миграции ≥10% (+10), право выпуска токенов (+40), transfer hook (+20: свой код
-  на каждом переводе может ограничивать продажи; у законных проектов бывает для комплаенса и роялти);
-  читаются оба типа аккаунта: `PoolConfig` и `ConfigWithTransferHook`;
-* **evidence** — что *наблюдалось* в отслеживаемых пулах: продажи токенов, которых продавец не покупал
-  в пуле (≥10 кошельков на пул: +50), один создатель на конфиг с ≥5 запусками (+20), стартовая
-  покупка создателя ≥50% порога (+20).
+- Public API for terminals, bots and launchpads (`/check`, `/latest`, `/stats` as JSON).
+- Decoding DAMM v2 events to confirm liquidity withdrawal automatically.
+- A "clean config" attestation that honest launchpads can show their users.
 
-Вердикт: **RED** — evidence ≥50 (продажи инсайдеров наблюдались); **SELF-GRAD** — создатель сам
-проходит всю кривую, покупателей на кривой нет; **AMBER** — capability ≥50; **GREEN** — остальное.
+## License
 
-Калибровка на 167 реальных конфигах (2 октября 2026): незаблокированная ликвидность сама по себе —
-норма экосистемы (шаблон Meteora Invent по умолчанию: partner 50% + creator 40% unlocked, получает
-GREEN); 100% заблокированной ликвидности — самый частый вариант; продажи «извне» наблюдались только
-в конфигах со связкой «creator unlocked + крупный остаток» (13 из 32 с данными, 0 из 27 остальных).
-
-## Операторы и шаблоны
-
-```bash
-./target/release/dbc-replay ../dbc.sqlite clusters            # кластеры операторов (2+ конфига)
-./target/release/dbc-replay ../dbc.sqlite clusters 2toDx      # кластер, в который входит конфиг
-./target/release/dbc-replay ../dbc.sqlite templates           # шаблоны параметров, общие для 2+ конфигов
-```
-
-* **Шаблон** — отпечаток (FNV-1a 64) всех экономических полей `PoolConfig` без адресов
-  `fee_claimer` и `leftover_receiver`, плюс признак transfer hook. Одинаковый отпечаток =
-  одинаковые правила. Шаблоном могут пользоваться и независимые люди, поэтому он конфиги
-  не объединяет.
-* **Кластер оператора** — конфиги, связанные общим получателем комиссий, общим получателем
-  остатка, общим создателем пулов или ≥3 общими кошельками-сателлитами.
-
-Перенос риска в `risk`: конфиг, связанный адресами с RED-конфигом, получает **RED-LINK**
-(+50 к evidence) — так новый конфиг оператора помечается ещё до первых сделок. Совпадение
-только шаблона с RED-конфигом даёт +20 к evidence, но вердикт не меняет.
-
-### Уточнения оценки
-
-* **Мгновенная graduation по конфигу:** порог миграции < 0,1 SOL (quote = SOL) — вердикт
-  SELF-GRAD сразу, без наблюдений: кривой как рынка нет, токен сразу уходит в DAMM v2, и
-  риски ликвидности и остатка относятся к покупателям в этом пуле.
-* **Адрес платформы:** если получатель остатка общий для 10+ конфигов и в его кластере нет
-  RED-конфигов, остаток считается хранимым платформой (как у Bags): флаг +5 с адресом вместо
-  +55/+20. Если в кластере есть RED, адрес считается адресом оператора.
-* `risk <конфиг>` показывает получателя комиссий и получателя остатка (с числом конфигов).
-
-## Цепочка доказательств по пулу
-
-```bash
-./target/release/dbc-collector trace HXQGobW9 --csv /path/to/solscan_defi_export.csv > trace_HXQG.md
-```
-
-Markdown со ссылками на Solscan: (1) стартовая покупка создателя; (2) для каждого кошелька,
-продававшего токены, которых не покупал в пуле, — входящий перевод перед первой продажей и
-адрес-источник (RPC, до 100 транзакций назад); (3) продажи этих кошельков в пул; (4) graduation;
-(5) по CSV-выгрузке Solscan «DeFi Activities» создателя — вывод остатка, снятие ликвидности и
-продажа в DAMM v2. Логи сборщика идут в stderr, поэтому вывод можно перенаправлять в файл.
-
-## Полнота обнаружения пулов
-
-* `WS_URLS` — несколько websocket-источников параллельно (например, Helius и PublicNode),
-  дубликаты отсекаются.
-* Сторожевой таймер: если источник молчит дольше `WS_STALL_SECS`, сборщик переподключается.
-* `WATCH_ADDRESSES` — адреса операторов, чьи транзакции опрашиваются напрямую: их запуски
-  находятся полностью, а пулы всегда отслеживаются.
-* Таблица `discovery` хранит, из какого источника пришла каждая подпись. Полнота по источникам:
-
-```sql
-SELECT d.source, COUNT(*) FROM pools p JOIN discovery d ON d.signature = p.created_sig GROUP BY d.source;
-```
-
-## Синтетичность активности (`impact`)
-
-```bash
-./target/release/dbc-replay ../dbc.sqlite impact --sol-usd 122
-./target/release/dbc-replay ../dbc.sqlite impact --since-hours 24
-```
-
-Кошельки пула делятся на **связанные** и **внешние**. Связанные: создатель; веерные продавцы
-(продают токены, ни разу не купив в пуле — признак 7); кошельки фермы — торгуют в ≥30% пулов
-конфига и при этом ≥80% всей их активности в базе приходится на этот конфиг (признак 8; так
-отделяются общие боты, торгующие все новые токены подряд); постоянные первые покупатели —
-покупают в первые ~10 с (25 слотов) в ≥50% пулов конфига (признак 10). Все остальные — внешние.
-
-По каждому оператору RED / RED-LINK: пулы, медианное время до миграции (признак 4), объём на
-кривой, доля связанного объёма (признак 9), число внешних кошельков и сколько SOL внешние
-оставили на кривой (покупки минус продажи; верхняя граница их потерь на кривой).
-
-Признаки 4, 8, 9, 10, 11 (одинаковая стартовая покупка ±0,01 SOL) входят в оценку `risk`:
-связанный объём ≥80% — +40, постоянный первый покупатель — +15, повтор стартовой покупки
-в ≥80% пулов — +15, миграция быстрее 5 минут — +10; веерная раздача ≥10 кошельков — +30.
-Вердикт RED теперь означает «синтетические запуски»: торговлю создают создатель и связанные кошельки.
-
-Специфичность кошельков считается **по кластеру оператора**, если в кластере несколько конфигов,
-хотя бы один позволяет забрать ликвидность и сбросить остаток, и ни у одного остаток не хранит
-адрес платформы (так ферма, разнесённая по нескольким конфигам, не попадает во внешние, а постоянные
-трейдеры честных площадок не попадают в ферму). Иначе — по конфигу.
-
-Доля связанного объёма считается только по пулам с реальной торговлей (≥3 сделок не от создателя):
-пулы с мгновенной graduation (одна покупка создателя) больше не дают ложные «100% связанного объёма»
-и остаются в категории SELF-GRAD.
-
-## Цепочка доказательств по пулу
-
-```bash
-./target/release/dbc-collector trace HXQGobW9 --csv /path/to/solscan_defi_export.csv > trace_HXQG.md
-```
-
-Markdown со ссылками на Solscan: (1) стартовая покупка создателя; (2) для каждого кошелька,
-продававшего токены, которых не покупал в пуле, — входящий перевод перед первой продажей и
-адрес-источник (RPC, до 100 транзакций назад); (3) продажи этих кошельков в пул; (4) graduation;
-(5) по CSV-выгрузке Solscan «DeFi Activities» создателя — вывод остатка, снятие ликвидности и
-продажа в DAMM v2. Логи сборщика идут в stderr, поэтому вывод можно перенаправлять в файл.
-
-## Полнота обнаружения пулов
-
-* `WS_URLS` — несколько websocket-источников параллельно (например, Helius и PublicNode),
-  дубликаты отсекаются.
-* Сторожевой таймер: если источник молчит дольше `WS_STALL_SECS`, сборщик переподключается.
-* `WATCH_ADDRESSES` — адреса операторов, чьи транзакции опрашиваются напрямую: их запуски
-  находятся полностью, а пулы всегда отслеживаются.
-* Таблица `discovery` хранит, из какого источника пришла каждая подпись. Полнота по источникам:
-
-```sql
-SELECT d.source, COUNT(*) FROM pools p JOIN discovery d ON d.signature = p.created_sig GROUP BY d.source;
-```
-
-## Потери покупателей
-
-```bash
-./target/release/dbc-replay ../dbc.sqlite damage --coverage 0.93 --sol-usd 122
-./target/release/dbc-replay ../dbc.sqlite damage --since-hours 24
-```
-
-По каждому оператору (кластеру) с вердиктом RED / RED-LINK: пулы обнаруженные / отслеживаемые /
-дошедшие до graduation; **измеренные потери** — SOL, которые покупатели (все, кроме создателя и
-кошельков, продававших токены без покупки в пуле) внесли в отслеживаемые пулы, дошедшие до
-graduation; оценка на все обнаруженные пулы (по доле отслеживаемых в каждом конфиге) и, с
-`--coverage`, на пропущенные сборщиком. Продажи сателлитов показаны отдельно и в потери не
-добавляются (двойной счёт). Пулы AMBER-конфигов показаны как «экспозиция», не как потери.
-Плюс разбивка измеренных потерь по дням (UTC).
-
-## Telegram-бот (`bot/`)
-
-Отдельный бинарник `dbc-radar-bot` на Teloxide: `Dispatcher` с двумя ветками — сообщения
-(команды разбираются через `match`) и нажатия инлайн-кнопок (сообщение редактируется на месте).
-Экранирование MarkdownV2 вынесено в `bot/src/markdown.rs`.
-
-* Отправь адрес токена, пула или конфига (или ссылку Solscan / DexScreener / Jupiter) — бот ответит
-  вердиктом и причинами. Если адреса нет в базе сборщика, бот сам находит пул через RPC (`RPC_URL`):
-  для пула читает аккаунт VirtualPool, для токена — его самую раннюю транзакцию (создание пула),
-  дописывает пул и конфиг в базу (пул помечается неотслеживаемым) и оценивает конфиг.
-  Принимаются и адреса пулов Meteora DAMM v2 и DLMM: бот берёт из пула токен и проверяет его.
-  Токены других лаунчпадов (pump.fun, Raydium LaunchLab, Moonshot) распознаются по программе,
-  создавшей токен, или по «фирменному» окончанию адреса, и бот прямо говорит, что это не DBC. Кнопки: детали конфига, оператор (кластер), последние запуски, Solscan.
-* Команды: `/start`, `/help`, `/check <адрес>`, `/stats`, `/how`.
-* Оценки берутся из `dbc-replay risk --json` (пересчёт каждые `REFRESH_SECS` и по запросу,
-  если конфиг ещё не оценён).
-* Если задан `ALERT_CHAT`, бот публикует в канал новые конфиги с вердиктом RED / RED-LINK / AMBER
-  (при первом запуске всё уже известное записывается в `bot_alerted.txt` без оповещений) и сводку
-  каждые `DIGEST_SECS`.
-
-```bash
-cd bot && cargo build --release
-./target/release/dbc-radar-bot     # запускать из корня репозитория, где лежат .env и dbc.sqlite
-```
+MIT
