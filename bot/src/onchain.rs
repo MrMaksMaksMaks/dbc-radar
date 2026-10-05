@@ -19,6 +19,29 @@ use crate::store::now;
 pub const DBC_PROGRAM_ID: &str = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN";
 const TOKEN_PROGRAMS: &[&str] = &["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"];
 
+/// Пулы Meteora, куда токены попадают после запуска: из них берём адреса токенов.
+/// DAMM v2: Pool { pool_fees: PoolFeesStruct (160 байт), token_a_mint, token_b_mint, ... }.
+/// DLMM: LbPair, token_x_mint / token_y_mint — смещения посчитаны по IDL DLMM.
+const DAMM_V2_PROGRAM: &str = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG";
+const DAMM_V2_POOL_DISC: [u8; 8] = [241, 154, 109, 4, 17, 177, 109, 188];
+const DAMM_V2_MINTS: (usize, usize) = (8 + 160, 8 + 192);
+const DLMM_PROGRAM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
+const DLMM_PAIR_DISC: [u8; 8] = [33, 11, 49, 98, 181, 101, 177, 13];
+const DLMM_MINTS: (usize, usize) = (88, 120);
+/// Типичные котируемые токены: в паре ищем «другой» токен.
+const QUOTE_MINTS: &[&str] = &[
+    "So11111111111111111111111111111111111111112",
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+];
+
+/// Программы других лаунчпадов: если токен создан ими, это не DBC.
+const OTHER_LAUNCHPADS: &[(&str, &str)] = &[
+    ("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P", "pump.fun"),
+    ("LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj", "Raydium LaunchLab"),
+    ("MoonCVVNZFSYkqNXP6bxHLPL6QQJiMagDL3qcqUQTrG", "Moonshot"),
+];
+
 const VIRTUAL_POOL_DISC: [u8; 8] = [213, 224, 5, 209, 98, 69, 119, 92];
 const TRANSFER_HOOK_POOL_DISC: [u8; 8] = [237, 219, 184, 23, 42, 189, 169, 35];
 const POOL_CONFIG_DISC: [u8; 8] = [26, 108, 14, 123, 116, 230, 129, 43];
@@ -93,6 +116,10 @@ pub fn parse_init_event(data: &[u8]) -> Option<(String, String, String, String, 
 #[derive(Debug)]
 pub enum Lookup {
     Found(FoundPool),
+    /// адрес — пул Meteora DAMM v2 или DLMM; проверять нужно токен этого пула
+    MeteoraPool { venue: &'static str, mint: String },
+    /// токен запущен на другом лаунчпаде; bool — вывод сделан только по окончанию адреса
+    OtherLaunchpad(&'static str, bool),
     /// это токен, но создание его пула не найдено в доступной истории узла
     MintWithoutHistory,
     NotDbc,
@@ -152,7 +179,7 @@ impl Rpc {
     }
 
     /// Пул по адресу токена: самая ранняя транзакция токена — создание пула.
-    async fn pool_by_mint(&self, mint: &str) -> Result<Option<FoundPool>> {
+    async fn pool_by_mint(&self, mint: &str) -> Result<MintOrigin> {
         let mut before: Option<String> = None;
         let mut oldest: Option<(String, u64, Option<i64>)> = None;
         for _ in 0..5 {
@@ -173,12 +200,12 @@ impl Rpc {
                 break;
             }
         }
-        let Some((sig, slot, t)) = oldest else { return Ok(None) };
+        let Some((sig, slot, t)) = oldest else { return Ok(MintOrigin::Unknown) };
         let tx = self
             .call_history("getTransaction", json!([sig, {"encoding": "json", "commitment": "confirmed", "maxSupportedTransactionVersion": 1}]))
             .await?;
         if tx.is_null() {
-            return Ok(None);
+            return Ok(MintOrigin::Unknown);
         }
         let str_arr = |p: &str| -> Vec<String> {
             tx.pointer(p).and_then(Value::as_array).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default()
@@ -186,6 +213,11 @@ impl Rpc {
         let mut keys = str_arr("/transaction/message/accountKeys");
         keys.extend(str_arr("/meta/loadedAddresses/writable"));
         keys.extend(str_arr("/meta/loadedAddresses/readonly"));
+        for (program, name) in OTHER_LAUNCHPADS {
+            if keys.iter().any(|k| k == program) {
+                return Ok(MintOrigin::Launchpad(name));
+            }
+        }
         for group in tx.pointer("/meta/innerInstructions").and_then(Value::as_array).cloned().unwrap_or_default() {
             for ix in group.get("instructions").and_then(Value::as_array).cloned().unwrap_or_default() {
                 let pid = ix.get("programIdIndex").and_then(Value::as_u64).unwrap_or(u64::MAX) as usize;
@@ -195,7 +227,7 @@ impl Rpc {
                 let Some(data) = ix.get("data").and_then(Value::as_str).and_then(|d| bs58::decode(d).into_vec().ok()) else { continue };
                 if let Some((pool, config, creator, base_mint, pool_type, activation_point)) = parse_init_event(&data) {
                     if base_mint == mint {
-                        return Ok(Some(FoundPool {
+                        return Ok(MintOrigin::Dbc(FoundPool {
                             pool,
                             config,
                             creator,
@@ -210,22 +242,63 @@ impl Rpc {
                 }
             }
         }
-        Ok(None)
+        Ok(MintOrigin::Unknown)
     }
 
-    /// Найти пул DBC по адресу пула или токена.
+    /// Найти пул DBC по адресу пула или токена (или пула Meteora, где торгуется токен).
     pub async fn resolve(&self, addr: &str) -> Result<Lookup> {
         let Some((owner, data)) = self.account(addr).await? else { return Ok(Lookup::NotDbc) };
         if owner == DBC_PROGRAM_ID {
             return Ok(parse_pool_account(addr, &data).map(Lookup::Found).unwrap_or(Lookup::NotDbc));
         }
+        if owner == DAMM_V2_PROGRAM {
+            return Ok(pair_mint(&data, DAMM_V2_POOL_DISC, DAMM_V2_MINTS)
+                .map(|mint| Lookup::MeteoraPool { venue: "DAMM v2", mint })
+                .unwrap_or(Lookup::NotDbc));
+        }
+        if owner == DLMM_PROGRAM {
+            return Ok(pair_mint(&data, DLMM_PAIR_DISC, DLMM_MINTS)
+                .map(|mint| Lookup::MeteoraPool { venue: "DLMM", mint })
+                .unwrap_or(Lookup::NotDbc));
+        }
         if TOKEN_PROGRAMS.contains(&owner.as_str()) {
             return Ok(match self.pool_by_mint(addr).await? {
-                Some(p) => Lookup::Found(p),
-                None => Lookup::MintWithoutHistory,
+                MintOrigin::Dbc(p) => Lookup::Found(p),
+                MintOrigin::Launchpad(name) => Lookup::OtherLaunchpad(name, false),
+                MintOrigin::Unknown => match launchpad_by_suffix(addr) {
+                    Some(name) => Lookup::OtherLaunchpad(name, true),
+                    None => Lookup::MintWithoutHistory,
+                },
             });
         }
         Ok(Lookup::NotDbc)
+    }
+}
+
+enum MintOrigin {
+    Dbc(FoundPool),
+    Launchpad(&'static str),
+    Unknown,
+}
+
+/// Токен пары, который не является котируемым (SOL, USDC, USDT).
+pub fn pair_mint(data: &[u8], disc: [u8; 8], (a, b): (usize, usize)) -> Option<String> {
+    if data.get(..8)? != disc {
+        return None;
+    }
+    let ma = pk(data.get(a..a + 32)?);
+    let mb = pk(data.get(b..b + 32)?);
+    if QUOTE_MINTS.contains(&ma.as_str()) { Some(mb) } else { Some(ma) }
+}
+
+/// Лаунчпады с «фирменным» окончанием адресов токенов.
+pub fn launchpad_by_suffix(mint: &str) -> Option<&'static str> {
+    if mint.ends_with("pump") {
+        Some("pump.fun")
+    } else if mint.ends_with("bonk") {
+        Some("letsbonk.fun (Raydium LaunchLab)")
+    } else {
+        None
     }
 }
 
@@ -303,6 +376,22 @@ mod tests {
         assert_eq!((p.pool_type, p.activation_point), (1, 777));
         d[0] = 0;
         assert!(parse_pool_account("P", &d).is_none());
+    }
+
+    #[test]
+    fn reads_pair_mints_and_suffixes() {
+        let mut d = vec![0u8; 8 + 1104];
+        d[..8].copy_from_slice(&DAMM_V2_POOL_DISC);
+        d[DAMM_V2_MINTS.0..DAMM_V2_MINTS.0 + 32].copy_from_slice(&[7u8; 32]);
+        let wsol = bs58::decode(QUOTE_MINTS[0]).into_vec().unwrap();
+        d[DAMM_V2_MINTS.1..DAMM_V2_MINTS.1 + 32].copy_from_slice(&wsol);
+        assert_eq!(pair_mint(&d, DAMM_V2_POOL_DISC, DAMM_V2_MINTS), Some(pk(&[7u8; 32])));
+        // токен на месте b, SOL на месте a
+        d[DAMM_V2_MINTS.0..DAMM_V2_MINTS.0 + 32].copy_from_slice(&wsol);
+        d[DAMM_V2_MINTS.1..DAMM_V2_MINTS.1 + 32].copy_from_slice(&[9u8; 32]);
+        assert_eq!(pair_mint(&d, DAMM_V2_POOL_DISC, DAMM_V2_MINTS), Some(pk(&[9u8; 32])));
+        assert_eq!(launchpad_by_suffix("7VertkgF9KLhxxJXHX6uaWuoYZTP9LdGj2bWmVXVpump"), Some("pump.fun"));
+        assert_eq!(launchpad_by_suffix("599xQ7SKdQ2zvzVgci7tYWzhP9qBnxBxJHrFGpTu2jFf"), None);
     }
 
     #[test]

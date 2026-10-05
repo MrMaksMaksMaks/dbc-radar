@@ -101,30 +101,72 @@ fn in_db(state: &State, addr: &str) -> bool {
 /// Адреса нет в базе: ищем пул через RPC, дописываем в базу и оцениваем.
 async fn check_onchain(bot: &Bot, chat: ChatId, state: &State, addr: &str) -> HandlerResult {
     let wait = send(bot, chat, esc("🔎 Not in our index yet — looking it up on-chain…"), None).await?;
-    let view = match state.rpc.resolve(addr).await {
-        Ok(crate::onchain::Lookup::Found(found)) => match crate::onchain::store_found(&state.cfg.db_path, &state.rpc, &found).await {
-            Ok(()) => {
-                if state.risk(&found.config).await.is_none() {
-                    if let Err(e) = state.refresh().await {
-                        tracing::warn!("refresh failed: {e:#}");
-                    }
-                }
-                pool_view(state, &found.pool).await.unwrap_or_else(|| not_found(addr))
-            }
-            Err(e) => err_view(e),
-        },
-        Ok(crate::onchain::Lookup::MintWithoutHistory) => (
-            format!(
-                "{}\n\n{}",
-                esc("This is a token, but we could not find its launch: either it was not launched on Meteora DBC, or the launch is older than the transaction history available to us."),
-                esc("If it is a DBC token, send its pool address instead — pools can be checked at any age.")
-            ),
-            Some(kb::back_home()),
-        ),
-        Ok(crate::onchain::Lookup::NotDbc) => not_found(addr),
-        Err(e) => err_view(e),
-    };
+    let view = onchain_view(state, addr).await;
     edit(bot, chat, wait.id, view.0, view.1).await
+}
+
+async fn onchain_view(state: &State, addr: &str) -> View {
+    use crate::onchain::Lookup;
+    match state.rpc.resolve(addr).await {
+        Ok(Lookup::Found(found)) => found_view(state, &found, addr).await,
+        // пул Meteora DAMM v2 / DLMM: проверяем его токен
+        Ok(Lookup::MeteoraPool { venue, mint }) => {
+            let note = format!("Meteora {venue} pool → token {mint}");
+            let inner = if in_db(state, &mint) {
+                resolve(state, &mint).await
+            } else {
+                match state.rpc.resolve(&mint).await {
+                    Ok(Lookup::Found(found)) => found_view(state, &found, &mint).await,
+                    Ok(Lookup::OtherLaunchpad(lp, by_suffix)) => other_launchpad(lp, by_suffix),
+                    Ok(Lookup::MintWithoutHistory) => mint_without_history(),
+                    Ok(_) => not_found(&mint),
+                    Err(e) => err_view(e),
+                }
+            };
+            (format!("{}\n\n{}", esc(&note), inner.0), inner.1)
+        }
+        Ok(Lookup::OtherLaunchpad(lp, by_suffix)) => other_launchpad(lp, by_suffix),
+        Ok(Lookup::MintWithoutHistory) => mint_without_history(),
+        Ok(Lookup::NotDbc) => not_found(addr),
+        Err(e) => err_view(e),
+    }
+}
+
+async fn found_view(state: &State, found: &crate::onchain::FoundPool, addr: &str) -> View {
+    match crate::onchain::store_found(&state.cfg.db_path, &state.rpc, found).await {
+        Ok(()) => {
+            if state.risk(&found.config).await.is_none() {
+                if let Err(e) = state.refresh().await {
+                    tracing::warn!("refresh failed: {e:#}");
+                }
+            }
+            pool_view(state, &found.pool).await.unwrap_or_else(|| not_found(addr))
+        }
+        Err(e) => err_view(e),
+    }
+}
+
+fn other_launchpad(lp: &str, by_suffix: bool) -> View {
+    let how = if by_suffix { " (judging by its address)" } else { "" };
+    (
+        format!(
+            "{}\n\n{}",
+            esc(&format!("This token was launched on {lp}{how}, not on Meteora DBC.")),
+            esc("DBC Radar checks launches on Meteora's Dynamic Bonding Curve: who can withdraw liquidity after graduation and whether trading is real.")
+        ),
+        Some(kb::back_home()),
+    )
+}
+
+fn mint_without_history() -> View {
+    (
+        format!(
+            "{}\n\n{}",
+            esc("This is a token, but we could not find its launch: either it was not launched on Meteora DBC, or the launch is older than the transaction history available to us."),
+            esc("If it is a DBC token, send its pool address instead — pools can be checked at any age.")
+        ),
+        Some(kb::back_home()),
+    )
 }
 
 /// Нужно ли пересчитать кэш, чтобы ответить про этот адрес (новый конфиг ещё не оценён).
