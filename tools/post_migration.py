@@ -38,6 +38,8 @@ RPS = float(os.environ.get("POST_RPS", "8"))  # Helius free: до 10 запро�
 MIN_SOL = 5_000_000  # 0,005 SOL: меньшие изменения — комиссии сети и рента, а не сделка
 DAMM_V2 = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG"
 DBC = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN"
+# владельцы хранилищ пулов (pool authority PDA программ DBC и DAMM v2) — это пул, а не участник
+POOL_AUTHORITIES = {"FhVo3mqL8PW5pH5U2CN4XE33DokiyZnUwuGpH2hmHLuM", "HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC"}
 WSOL = "So11111111111111111111111111111111111111112"
 B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
@@ -136,6 +138,31 @@ def find_damm_pool(tx):
     return None
 
 
+def owner_deltas(tx, mint):
+    """Изменения по владельцам: {владелец: лампорты}, {владелец: единицы токена}.
+
+    Лампорты считаются по всем аккаунтам транзакции; токен-аккаунт (в т.ч. обёрнутый SOL)
+    относится к своему владельцу. Так видны и участники, за которых комиссию платит релейер."""
+    meta = tx["meta"]
+    keys = tx_keys(tx)
+    owner_of = {}
+    for e in (meta.get("preTokenBalances") or []) + (meta.get("postTokenBalances") or []):
+        if e.get("owner"):
+            owner_of[e["accountIndex"]] = e["owner"]
+    sol = defaultdict(int)
+    for i, k in enumerate(keys):
+        if i < len(meta["postBalances"]):
+            sol[owner_of.get(i, k)] += meta["postBalances"][i] - meta["preBalances"][i]
+    tok = defaultdict(int)
+    for e in meta.get("preTokenBalances") or []:
+        if e.get("mint") == mint and e.get("owner"):
+            tok[e["owner"]] -= int(e["uiTokenAmount"]["amount"])
+    for e in meta.get("postTokenBalances") or []:
+        if e.get("mint") == mint and e.get("owner"):
+            tok[e["owner"]] += int(e["uiTokenAmount"]["amount"])
+    return sol, tok
+
+
 def deltas(tx, signer, mint):
     """(изменение SOL с учётом wSOL, изменение токена) у подписанта, в лампортах и единицах токена."""
     meta = tx["meta"]
@@ -211,7 +238,7 @@ def main():
 
     total = defaultdict(float)
     print(f"\n{'token':<9} {'curve tx':>8} {'damm tx':>8} {'span':>8} | {'op curve':>8} {'LP out':>7} {'op damm':>8} "
-          f"{'farm vol':>8} | {'OPERATOR':>8} | {'ext curve':>9} {'ext damm':>8} {'ext buys':>8}")
+          f"{'farm vol':>8} | {'OPERATOR':>8} | {'ext curve':>9} {'ext damm':>8} {'ext buys':>8} | {'left':>7}")
     for pool, mint, grad_time, created in sample:
         graduated = grad_time is not None
         if not graduated:
@@ -252,31 +279,35 @@ def main():
             signer = tx["transaction"]["message"]["accountKeys"][0]
             in_damm = uses(tx, DAMM_V2)
             in_dbc = uses(tx, DBC)
-            sol, tok = deltas(tx, signer, mint)
-            k = kind(sol, tok)
             t = tx.get("blockTime") or 0
-            v = sol / 1e9
             phase = "migr" if (in_dbc and in_damm) else ("damm" if in_damm else "curve")
-            is_l = signer in linked
-            if VERBOSE:
-                print(f"    t{t - grad_time:>+8}s  {s['signature'][:10]}  {signer[:8]} {'L' if is_l else 'E'}  "
-                      f"{phase:<5}  SOL {v:+9.4f}  token {tok:+d}  {k}")
             if phase != "curve":
                 last_t = max(last_t, t)
-            if is_l:
-                if phase == "curve":
-                    st["op_curve"] += v  # всё, включая создание пула, торговлю фермы и комиссии сети
-                elif phase == "migr" or k == "remove_liq":
-                    st["lp_out"] += v
+            sol_by, tok_by = owner_deltas(tx, mint)
+            for owner in set(sol_by) | set(tok_by):
+                if owner in POOL_AUTHORITIES or owner in (DBC, DAMM_V2):
+                    continue
+                sol, tok = sol_by.get(owner, 0), tok_by.get(owner, 0)
+                is_l = owner in linked
+                if not is_l and tok == 0:
+                    continue  # не участник сделки: рента новых аккаунтов, плата релейеру и т. п.
+                k = kind(sol, tok)
+                v = sol / 1e9
+                if VERBOSE and (abs(sol) >= 1_000_000 or tok):
+                    print(f"    t{t - grad_time:>+8}s  {s['signature'][:10]}  {owner[:8]} {'L' if is_l else 'E'}"
+                          f"{'' if owner == signer else '*'}  {phase:<5}  SOL {v:+9.4f}  token {tok:+d}  {k}")
+                if is_l:
+                    if phase == "curve":
+                        st["op_curve"] += v  # всё: создание пула, торговля фермы, комиссии сети
+                    elif phase == "migr" or k == "remove_liq":
+                        st["lp_out"] += v
+                    else:
+                        st["op_damm"] += v
+                        if k in ("buy", "sell"):
+                            st["farm_vol"] += abs(v)
                 else:
-                    st["op_damm"] += v
-                    if k in ("buy", "sell"):
-                        st["farm_vol"] += abs(v)
-            elif tok != 0:
-                # у внешних — любая сделка с токеном, даже мельче 0,005 SOL: мелкие покупки ботов
-                # в сумме бывают заметны, а у оператора считаются все изменения баланса
-                st["ext_" + ("curve" if phase == "curve" else "damm")] += v
-                st["ext_buys"] += tok > 0 and sol < 0 and phase != "curve"
+                    st["ext_" + ("curve" if phase == "curve" else "damm")] += v
+                    st["ext_buys"] += tok > 0 and sol < 0 and phase != "curve"
         op = st["op_curve"] + st["lp_out"] + st["op_damm"]
         for k2 in ("op_curve", "lp_out", "op_damm", "farm_vol", "ext_curve", "ext_damm", "ext_buys", "errors"):
             total[k2] += st[k2]
@@ -287,7 +318,7 @@ def main():
         span = f"{last_t - grad_time:>7}s" if graduated else "  no grad"
         print(f"{mint[:8]:<9} {tc:>8} {td:>8} {span} | {st['op_curve']:>+8.3f} {st['lp_out']:>7.3f} "
               f"{st['op_damm']:>+8.3f} {st['farm_vol']:>8.1f} | {op:>+8.3f} | {st['ext_curve']:>+9.3f} {st['ext_damm']:>+8.3f} "
-              f"{int(st['ext_buys']):>8}")
+              f"{int(st['ext_buys']):>8} | {-(op + st['ext_curve'] + st['ext_damm']):>+7.3f}")
 
     if total["pools"]:
         n = total["pools"]
@@ -300,7 +331,9 @@ def main():
           "\n       SOL is the signer's balance change incl. network fees; positive = received, negative = paid;"
           "\n       OPERATOR = all linked signers together (creator, receivers, farm); externals = everyone else;"
           "\n       '+' after a tx count = limit reached (raise max_tx); span = last DAMM/migration tx after completion;"
-          "\n       externals: every transaction that changes their token balance, of any size;"
+          "\n       balances are counted per owner over all accounts of a transaction (also when a relayer pays the fee;"
+          "\n       '*' in -v marks such owners); pool vaults are excluded; externals = owners whose token balance changed;"
+          "\n       left = -(OPERATOR + externals): SOL left in the pool, fees and rent; should be small and >= 0;"
           "\n       farm funding transfers and leftover tokens (unsold supply) are not counted.")
 
 if __name__ == "__main__":
