@@ -31,7 +31,7 @@ use dynamic_bonding_curve::{
     params::swap::TradeDirection,
     state::{fee::FeeMode, PoolConfig, SwapResult2},
 };
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 const WSOL: &str = "So11111111111111111111111111111111111111112";
 
@@ -468,24 +468,50 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
         }
     }
 
-    // Общий адрес получателя остатка считается «адресом платформы» только у чистых кластеров:
-    // если в кластере есть конфиг с наблюдаемыми инсайдерскими продажами, это адрес оператора.
-    for c in &clusters {
-        let has_red = c.members.iter().any(|&m| rows[m].rep.verdict == risk::Verdict::Synthetic);
-        if !has_red {
+    // Конфиги с наблюдаемыми инсайдерскими продажами (вердикт по собственным доказательствам).
+    let red: Vec<bool> = rows.iter().map(|r| r.rep.verdict == risk::Verdict::Synthetic).collect();
+
+    // Общий адрес (получатель комиссий или остатка) во многих конфигах — адрес платформы
+    // (лаунчпада), если синтетика наблюдается меньше чем в половине его конфигов.
+    // Иначе это адрес оператора, даже если конфигов у него много. Один оператор на лаунчпаде
+    // не должен окрашивать честные конфиги той же платформы.
+    let mut addr_stats: HashMap<(cluster::LinkKind, String), (usize, usize)> = HashMap::new();
+    for (i, info) in infos.iter().enumerate() {
+        for (kind, addr) in [
+            (cluster::LinkKind::FeeClaimer, &info.fee_claimer),
+            (cluster::LinkKind::LeftoverReceiver, &info.leftover_receiver),
+        ] {
+            if let Some(a) = addr {
+                let e = addr_stats.entry((kind, a.clone())).or_default();
+                e.0 += 1;
+                e.1 += red[i] as usize;
+            }
+        }
+    }
+    let is_platform = |kind: cluster::LinkKind, addr: &str| -> bool {
+        let (total, reds) = addr_stats.get(&(kind, addr.to_string())).copied().unwrap_or((1, 0));
+        total >= risk::PLATFORM_MIN_CONFIGS && reds * 2 < total
+    };
+
+    // Получатель остатка, общий для многих конфигов, по умолчанию считается адресом платформы
+    // (хранение у платформы безопаснее); если это адрес оператора — снимаем эту скидку.
+    for (i, r) in rows.iter_mut().enumerate() {
+        if r.facts.leftover_receiver_configs < risk::PLATFORM_MIN_CONFIGS {
             continue;
         }
-        for &m in &c.members {
-            let r = &mut rows[m];
-            if r.facts.leftover_receiver_configs >= risk::PLATFORM_MIN_CONFIGS {
+        if let Some(a) = &infos[i].leftover_receiver {
+            if !is_platform(cluster::LinkKind::LeftoverReceiver, a) {
                 r.facts.leftover_receiver_configs = 1;
                 r.rep = risk::score(&r.facts, &r.beh);
             }
         }
     }
 
-    // Перенос риска.
-    let red: Vec<bool> = rows.iter().map(|r| r.rep.verdict == risk::Verdict::Synthetic).collect();
+    // Перенос риска — только по ПРЯМЫМ связям конфига с RED-конфигами (без цепочек через кластер):
+    //   * общий создатель пулов, общий адрес оператора (не платформы) — RED-LINK;
+    //   * только общие сателлиты (>= MIN_SHARED_SATELLITES) — RED-LINK, если сам конфиг рискованный
+    //     (capability >= 50), иначе информационный флаг;
+    //   * только общий адрес платформы — информационный флаг.
     let mut red_templates: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for (i, r) in rows.iter().enumerate() {
         if red[i] {
@@ -493,24 +519,89 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
         }
     }
     for c in &clusters {
-        let red_in_cluster = c.members.iter().filter(|&&m| red[m]).count();
-        let kinds: Vec<&str> = c.links.keys().map(|k| k.label()).collect();
+        let reds: Vec<usize> = c.members.iter().copied().filter(|&m| red[m]).collect();
         for &m in &c.members {
             if red[m] {
                 continue;
             }
+            let mi = &infos[m];
+            let my_sats: HashSet<&str> = mi.satellites.iter().map(String::as_str).collect();
+            let mut strong_kinds: BTreeSet<cluster::LinkKind> = BTreeSet::new();
+            let mut platform_kinds: BTreeSet<cluster::LinkKind> = BTreeSet::new();
+            let (mut strong_n, mut sat_n, mut platform_n) = (0usize, 0usize, 0usize);
+            for &k in &reds {
+                let ki = &infos[k];
+                let mut strong = false;
+                let mut platform = false;
+                if mi.creators.iter().any(|a| ki.creators.contains(a)) {
+                    strong_kinds.insert(cluster::LinkKind::Creator);
+                    strong = true;
+                }
+                for (kind, a, b) in [
+                    (cluster::LinkKind::FeeClaimer, &mi.fee_claimer, &ki.fee_claimer),
+                    (cluster::LinkKind::LeftoverReceiver, &mi.leftover_receiver, &ki.leftover_receiver),
+                ] {
+                    if let (Some(a), Some(b)) = (a, b) {
+                        if a == b {
+                            if is_platform(kind, a) {
+                                platform_kinds.insert(kind);
+                                platform = true;
+                            } else {
+                                strong_kinds.insert(kind);
+                                strong = true;
+                            }
+                        }
+                    }
+                }
+                let shared = ki.satellites.iter().filter(|s| my_sats.contains(s.as_str())).count();
+                let sat = shared >= cluster::MIN_SHARED_SATELLITES;
+                if strong {
+                    strong_n += 1;
+                    if sat {
+                        strong_kinds.insert(cluster::LinkKind::Satellites);
+                    }
+                } else if sat {
+                    sat_n += 1;
+                } else if platform {
+                    platform_n += 1;
+                }
+            }
+            let labels = |s: &BTreeSet<cluster::LinkKind>| s.iter().map(|k| k.label()).collect::<Vec<_>>().join(", ");
             let r = &mut rows[m];
-            if red_in_cluster > 0 {
+            let risky_itself = r.rep.capability >= 50;
+            if strong_n > 0 || (sat_n > 0 && risky_itself) {
+                let mut kinds = strong_kinds.clone();
+                if sat_n > 0 {
+                    kinds.insert(cluster::LinkKind::Satellites);
+                }
                 r.rep.evidence_flags.push(risk::Flag {
                     points: 50,
                     text: format!(
                         "linked by shared {} to {} config(s) with observed insider selling (operator cluster #{})",
-                        kinds.join(", "),
-                        red_in_cluster,
+                        labels(&kinds),
+                        strong_n + sat_n,
                         c.id
                     ),
                 });
                 r.rep.verdict = risk::Verdict::RedLinked;
+            } else if sat_n > 0 {
+                r.rep.evidence_flags.push(risk::Flag {
+                    points: 0,
+                    text: format!(
+                        "shares {}+ selling wallets with {} config(s) with observed insider selling; not enough to flag this config on its own",
+                        cluster::MIN_SHARED_SATELLITES,
+                        sat_n
+                    ),
+                });
+            } else if platform_n > 0 {
+                r.rep.evidence_flags.push(risk::Flag {
+                    points: 0,
+                    text: format!(
+                        "same launchpad address ({}) as {} config(s) with observed insider selling; a shared platform address is not treated as a link",
+                        labels(&platform_kinds),
+                        platform_n
+                    ),
+                });
             } else if let Some(n) = red_templates.get(&r.template) {
                 r.rep.evidence_flags.push(risk::Flag {
                     points: 20,
