@@ -29,8 +29,8 @@ VERBOSE = "-v" in sys.argv
 ARGS = [a for a in sys.argv[1:] if a != "-v"]
 CLUSTER = ARGS[0] if len(ARGS) > 0 else "5"
 SAMPLE = int(ARGS[1]) if len(ARGS) > 1 else 15
-MAX_TX = int(ARGS[2]) if len(ARGS) > 2 else 150
-RPS = 4.0
+MAX_TX = int(ARGS[2]) if len(ARGS) > 2 else 600
+RPS = float(os.environ.get("POST_RPS", "8"))  # Helius free: до 10 запросов в секунду
 MIN_SOL = 5_000_000  # 0,005 SOL: меньшие изменения — комиссии сети и рента, а не сделка
 DAMM_V2 = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG"
 DBC = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN"
@@ -187,17 +187,16 @@ def main():
         cfgs + [now - 5 * 86400, now - 86400, SAMPLE]).fetchall()
 
     total = defaultdict(float)
-    print(f"\n{'token':<10} {'tx':>4} {'damm':>4}  {'ext buys':>8} {'ext SOL in':>10} {'ext SOL out':>11}  "
-          f"{'linked SOL out':>14}  {'ext buys before/after 1st linked exit':>38}")
+    print(f"\n{'token':<9} {'tx':>5} {'span':>7}  {'LP out':>7}  {'farm vol':>8} {'farm net':>8}  "
+          f"{'ext vol':>7} {'ext net':>8} {'ext buys':>8}  {'linked share':>12}")
     for pool, mint, grad_time in sample:
         try:
             # 1) история минта после завершения кривой — чтобы найти пул DAMM v2;
             # 2) история самого пула: создание при миграции, выводы ликвидности и свопы
-            #    (в истории минта часть транзакций отсутствует: минт бывает в lookup-таблице)
             sigs = signatures_after(mint, grad_time)[:MAX_TX]
             damm = None
             for s0 in sigs:
-                tx0 = rpc("getTransaction", [s0["signature"], {"encoding": "json", "maxSupportedTransactionVersion": 0}])
+                tx0 = rpc("getTransaction", [s0["signature"], {"encoding": "json", "maxSupportedTransactionVersion": 1}])
                 if tx0 and uses(tx0, DAMM_V2):
                     damm = find_damm_pool(tx0)
                     if damm:
@@ -207,14 +206,18 @@ def main():
             if VERBOSE:
                 print(f"  {mint[:8]}: DAMM v2 pool {damm or 'not found'}; {len(sigs)} transactions")
         except Exception as e:  # noqa: BLE001
-            print(f"{mint[:8]:<10} rpc error: {e}")
+            print(f"{mint[:8]:<9} rpc error: {e}")
             continue
         st = defaultdict(float)
-        damm_tx = 0
-        first_exit = None
-        buys = []  # время внешних покупок
+        last_t = grad_time
         for s in sigs:
-            tx = rpc("getTransaction", [s["signature"], {"encoding": "json", "maxSupportedTransactionVersion": 0}])
+            try:
+                tx = rpc("getTransaction", [s["signature"], {"encoding": "json", "maxSupportedTransactionVersion": 1}])
+            except Exception as e:  # noqa: BLE001
+                st["errors"] += 1
+                if VERBOSE:
+                    print(f"    {s['signature'][:10]}  error: {str(e)[:80]}")
+                continue
             if not tx:
                 continue
             signer = tx["transaction"]["message"]["accountKeys"][0]
@@ -228,41 +231,42 @@ def main():
                 print(f"    t{t - grad_time:>+7}s  {s['signature'][:10]}  {signer[:8]} {'L' if signer in linked else 'E'}  "
                       f"{progs:<8}  SOL {sol / 1e9:+9.4f}  token {tok:+d}  {k}")
             if in_dbc and not in_damm:
-                continue  # сделка на кривой DBC в секунду завершения, не после миграции
-            damm_tx += in_damm
+                continue  # сделка на кривой DBC, не после миграции
+            last_t = max(last_t, t)
+            v = sol / 1e9
             if signer in linked:
-                if sol > 0:
-                    st["linked_out"] += sol / 1e9
-                if k in ("remove_liq", "sell") and first_exit is None:
-                    first_exit = t
-            else:
-                if k == "buy":
-                    st["ext_in"] += -sol / 1e9
-                    buys.append(t)
-                elif k == "sell":
-                    st["ext_out"] += sol / 1e9
-        before = sum(1 for t in buys if first_exit is None or t < first_exit)
-        after = len(buys) - before
-        for k2 in ("ext_in", "ext_out", "linked_out"):
-            total[k2] += st[k2]
-        total["buys"] += len(buys)
-        total["pools"] += 1
+                if k == "remove_liq" or (in_dbc and v > 0):
+                    st["lp_out"] += v  # вывод ликвидности (в т.ч. пакетом с миграцией)
+                elif k in ("buy", "sell"):
+                    st["farm_vol"] += abs(v)
+                    st["farm_net"] += v
+            elif k in ("buy", "sell"):
+                st["ext_vol"] += abs(v)
+                st["ext_net"] += v
+                st["ext_buys"] += k == "buy"
+        vol = st["farm_vol"] + st["ext_vol"]
+        share = f"{100 * st['farm_vol'] / vol:.0f}%" if vol else "-"
         trunc = "+" if len(sigs) >= MAX_TX else ""
-        print(f"{mint[:8]:<10} {len(sigs):>3}{trunc:<1} {damm_tx:>4}  {len(buys):>8} {st['ext_in']:>10.3f} {st['ext_out']:>11.3f}  "
-              f"{st['linked_out']:>14.3f}  {before:>18} / {after}")
+        for k2 in ("lp_out", "farm_vol", "farm_net", "ext_vol", "ext_net", "ext_buys", "errors"):
+            total[k2] += st[k2]
+        total["pools"] += 1
+        print(f"{mint[:8]:<9} {len(sigs):>4}{trunc:<1} {last_t - grad_time:>6}s  {st['lp_out']:>7.3f}  "
+              f"{st['farm_vol']:>8.2f} {st['farm_net']:>+8.3f}  {st['ext_vol']:>7.3f} {st['ext_net']:>+8.3f} "
+              f"{int(st['ext_buys']):>8}  {share:>12}")
 
     if total["pools"]:
         n = total["pools"]
-        print(f"\nTOTAL over {int(n)} pools: external buys {int(total['buys'])}, "
-              f"external SOL in {total['ext_in']:.3f}, out {total['ext_out']:.3f}, "
-              f"net left by externals {total['ext_in'] - total['ext_out']:.3f} SOL "
-              f"({(total['ext_in'] - total['ext_out']) / n:.3f} per pool); linked SOL out {total['linked_out']:.3f}")
-    print("notes: tx = transactions of the token after graduation (any venue); damm = of them touching DAMM v2;"
-          "\n       history starts at the curve-completion second; DBC-only transactions (curve trades) are skipped;"
-          "\n       changes under 0.005 SOL are treated as fees or transfers, not trades;"
-          "\n       SOL changes include network fees and rent; 'linked SOL out' includes the operator's own liquidity withdrawals"
-          "\n       (mostly its own SOL from the curve), so compare it with what externals left, not with zero.")
-
+        vol = total["farm_vol"] + total["ext_vol"]
+        print(f"\nTOTAL over {int(n)} pools: LP withdrawn by linked {total['lp_out']:.2f} SOL; "
+              f"farm volume {total['farm_vol']:.1f} SOL (net {total['farm_net']:+.2f}); "
+              f"external volume {total['ext_vol']:.2f} SOL (net {total['ext_net']:+.3f}, {int(total['ext_buys'])} buys); "
+              f"linked share of DAMM v2 volume {100 * total['farm_vol'] / vol if vol else 0:.0f}%"
+              + (f"; {int(total['errors'])} tx errors" if total["errors"] else ""))
+    print("notes: history of the DAMM v2 pool from 10 min before curve completion; DBC-only transactions skipped;"
+          "\n       span = last transaction counted, seconds after completion ('+' after tx = limit reached);"
+          "\n       LP out = SOL received by linked addresses in liquidity removals (incl. the migration bundle);"
+          "\n       farm/ext net = SOL received minus SOL spent in trades (negative = paid into the pool);"
+          "\n       changes under 0.005 SOL are treated as fees or transfers, not trades.")
 
 if __name__ == "__main__":
     main()
