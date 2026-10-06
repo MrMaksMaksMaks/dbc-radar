@@ -702,7 +702,10 @@ fn run_risk(conn: &rusqlite::Connection, args: &Args) -> Result<()> {
                 println!("  launch -> migration  {:.0} s (median)", m);
             }
             if let Some((sol, sh)) = fs.dev_buy_mode {
-                println!("  opening buy          {:.2} SOL in {:.0}% of pools", sol, sh * 100.0);
+                println!("  opening buy          {} SOL in {:.0}% of pools", farm::fmt_sol(sol), sh * 100.0);
+            }
+            if let Some((sol, sh)) = fs.first_buy_mode {
+                println!("  first non-creator buy {} SOL in {:.0}% of pools", farm::fmt_sol(sol), sh * 100.0);
             }
         }
         for fl in &r.rep.evidence_flags {

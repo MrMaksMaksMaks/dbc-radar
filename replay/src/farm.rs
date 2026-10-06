@@ -8,7 +8,9 @@
 //!       которые торгуют все новые токены подряд;
 //!   9.  доля связанного объёма: объём создателя, фермы и веерных продавцов к общему;
 //!   10. постоянный «первый покупатель»: кошелёк покупает в первые секунды большинства пулов;
-//!   11. фиксированная дев-покупка: одинаковая стартовая покупка создателя.
+//!   11. фиксированная стартовая покупка: одинаковая сумма первой покупки создателя
+//!       или — если оператор начинает с кошелька фермы — первой покупки не от создателя
+//!       (общие боты, торгующие все новые токены, при этом пропускаются).
 //! Всё остальное — «внешние» участники; их результат на кривой считается отдельно.
 
 use anyhow::Result;
@@ -49,6 +51,8 @@ pub struct FarmStats {
     pub first_buyers: usize,
     /// (сумма в SOL, доля пулов с этой суммой) — самая частая стартовая покупка создателя
     pub dev_buy_mode: Option<(f64, f64)>,
+    /// то же для первой покупки не от создателя (без общих ботов)
+    pub first_buy_mode: Option<(f64, f64)>,
     pub median_fanout: Option<f64>,
     pub median_linked_share: Option<f64>,
     /// пулов с реальной торговлей (>= MIN_ACTIVE_SWAPS сделок не от создателя)
@@ -94,6 +98,40 @@ fn median(mut v: Vec<f64>) -> Option<f64> {
 }
 
 /// SOL-объём сделки: покупка — сколько SOL вошло, продажа — сколько вышло.
+/// Округление суммы до трёх значащих цифр: «одинаковая сумма» и для 8,06 SOL, и для 0,00123 SOL.
+fn sig3(l: u64) -> u64 {
+    if l < 1000 {
+        return l;
+    }
+    let digits = (l as f64).log10().floor() as u32;
+    let unit = 10u64.pow(digits - 2);
+    (l + unit / 2) / unit * unit
+}
+
+/// Самая частая сумма (с точностью до трёх значащих цифр) и её доля: (SOL, доля).
+fn amount_mode(v: &[u64]) -> Option<(f64, f64)> {
+    if v.len() < MIN_POOLS {
+        return None;
+    }
+    let mut buckets: HashMap<u64, usize> = HashMap::new();
+    for a in v {
+        *buckets.entry(sig3(*a)).or_default() += 1;
+    }
+    let (b, c) = buckets.into_iter().max_by_key(|(_, c)| *c)?;
+    Some((b as f64 / 1e9, c as f64 / v.len() as f64))
+}
+
+/// Сумма в SOL для текста: мелкие суммы с нужным числом знаков, а не «0.00».
+pub fn fmt_sol(sol: f64) -> String {
+    if sol >= 0.1 {
+        format!("{sol:.2}")
+    } else if sol >= 0.001 {
+        format!("{sol:.4}")
+    } else {
+        format!("{sol:.6}")
+    }
+}
+
 fn sol_volume(s: &Swap) -> u64 {
     if s.buy { s.input } else { s.output }
 }
@@ -162,12 +200,15 @@ pub fn analyze_scope(
     let mut early_in: HashMap<&str, u32> = HashMap::new();
     let mut fanout_per_pool: Vec<HashSet<&str>> = Vec::with_capacity(n);
     let mut dev_buys: Vec<u64> = Vec::new();
+    // первые покупки не от создателя (до 5 на пул): кошелёк и сумма, по порядку
+    let mut opening: Vec<Vec<(&str, u64)>> = Vec::with_capacity(n);
     for p in &pools {
         let buyers: HashSet<&str> = p.swaps.iter().filter(|s| s.buy).map(|s| s.wallet.as_str()).collect();
         let mut seen: HashSet<&str> = HashSet::new();
         let mut early: HashSet<&str> = HashSet::new();
         let mut fanout: HashSet<&str> = HashSet::new();
         let mut dev = 0u64;
+        let mut first: Vec<(&str, u64)> = Vec::new();
         for s in &p.swaps {
             let w = s.wallet.as_str();
             if w == p.creator {
@@ -175,6 +216,9 @@ pub fn analyze_scope(
                     dev += s.input;
                 }
                 continue;
+            }
+            if s.buy && first.len() < 5 {
+                first.push((w, s.input));
             }
             seen.insert(w);
             if s.buy && s.slot <= p.created_slot + EARLY_SLOTS {
@@ -194,6 +238,7 @@ pub fn analyze_scope(
             dev_buys.push(dev);
         }
         fanout_per_pool.push(fanout);
+        opening.push(first);
     }
 
     let specific = |w: &str, k: u32| -> bool {
@@ -218,15 +263,20 @@ pub fn analyze_scope(
     }
     out.farm_wallets = farm.len();
 
-    // фиксированная дев-покупка: самая частая сумма с точностью 0,01 SOL
-    if dev_buys.len() >= MIN_POOLS {
-        let mut buckets: HashMap<u64, usize> = HashMap::new();
-        for d in &dev_buys {
-            *buckets.entry((d + 5_000_000) / 10_000_000).or_default() += 1;
+    // фиксированная стартовая покупка создателя
+    out.dev_buy_mode = amount_mode(&dev_buys);
+    // фиксированная первая покупка не от создателя: первая покупка в пуле от кошелька,
+    // который не является общим ботом (общие боты с фиксированной суммой есть в любом конфиге)
+    let mut first_buys: Vec<u64> = Vec::new();
+    for (p, first) in pools.iter().zip(&opening) {
+        if !metric_set.contains(p.config.as_str()) {
+            continue;
         }
-        let (b, c) = buckets.into_iter().max_by_key(|(_, c)| *c).unwrap();
-        out.dev_buy_mode = Some((b as f64 * 0.01, c as f64 / dev_buys.len() as f64));
+        if let Some((_, amount)) = first.iter().find(|(w, _)| specific(w, in_pools.get(w).copied().unwrap_or(1))) {
+            first_buys.push(*amount);
+        }
     }
+    out.first_buy_mode = amount_mode(&first_buys);
 
     // --- Метрики активности (только пулы в окне) ---
     let mut mig = Vec::new();
@@ -281,6 +331,18 @@ mod tests {
     /// 4 пула: создатель с одинаковой покупкой, ферма F1..F3 в каждом пуле (и нигде больше),
     /// общий бот BOT торгует ещё в 6 чужих пулах, внешний покупатель — по одному на пул.
     #[test]
+    fn rounds_amounts_and_formats_small_sums() {
+        assert_eq!(sig3(8_057_000_000), 8_060_000_000);
+        assert_eq!(sig3(1_234_567), 1_230_000);
+        assert_eq!(sig3(999), 999);
+        assert_eq!(amount_mode(&[1_234_000, 1_231_000, 1_229_000, 5_000_000]), Some((0.00123, 0.75)));
+        assert_eq!(amount_mode(&[1, 2]), None);
+        assert_eq!(fmt_sol(0.00123), "0.0012");
+        assert_eq!(fmt_sol(8.06), "8.06");
+        assert_eq!(fmt_sol(0.000012), "0.000012");
+    }
+
+    #[test]
     fn separates_farm_from_generic_bots_and_externals() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -319,6 +381,8 @@ mod tests {
         assert_eq!(f.median_migration_secs, Some(70.0));
         let (sol, share) = f.dev_buy_mode.unwrap();
         assert!((sol - 8.06).abs() < 0.011 && share == 1.0);
+        // первая покупка не от создателя — F1 на 1 SOL (BOT пропускается как общий бот)
+        assert_eq!(f.first_buy_mode, Some((1.0, 1.0)));
         assert_eq!(f.external_wallets, 5, "4 внешних + общий бот");
         assert!((f.external_net_in_sol() - (4.0 * 0.2 + 4.0 * 0.01)).abs() < 1e-9);
         assert!(f.median_linked_share.unwrap() > 0.9);

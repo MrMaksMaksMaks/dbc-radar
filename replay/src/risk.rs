@@ -365,10 +365,24 @@ pub fn score(f: &ConfigFacts, b: &Behavior) -> Report {
         if fs.first_buyers > 0 {
             add(&mut ev, 15, format!("{} wallet(s) buy in the first seconds of most pools of this config", fs.first_buyers));
         }
-        if let Some((sol, share)) = fs.dev_buy_mode {
-            if share >= 0.8 {
-                add(&mut ev, 15, format!("creator's opening buy is the same {sol:.2} SOL in {:.0}% of pools", share * 100.0));
-            }
+        // скриптовый старт: одинаковая первая покупка создателя или, если оператор начинает
+        // с кошелька фермы, одинаковая первая покупка не от создателя; баллы — один раз
+        if let Some((sol, share)) = fs.dev_buy_mode.filter(|(_, s)| *s >= 0.8) {
+            add(
+                &mut ev,
+                15,
+                format!("creator's opening buy is the same {} SOL in {:.0}% of pools", crate::farm::fmt_sol(sol), share * 100.0),
+            );
+        } else if let Some((sol, share)) = fs.first_buy_mode.filter(|(_, s)| *s >= 0.8) {
+            add(
+                &mut ev,
+                15,
+                format!(
+                    "the first buy after launch (not by the creator) is the same {} SOL in {:.0}% of pools",
+                    crate::farm::fmt_sol(sol),
+                    share * 100.0
+                ),
+            );
         }
         if let Some(m) = fs.median_migration_secs {
             if m < 300.0 && !f.instant_graduation {
