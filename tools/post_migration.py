@@ -178,10 +178,21 @@ def main():
             linked.add(fc)
         if raw and len(raw) >= 104:
             linked.add(b58(bytes(raw[72:104])))
-    farm = {r[0] for r in db.execute(
-        f"SELECT fee_payer FROM swaps WHERE config IN ({ph}) GROUP BY fee_payer HAVING COUNT(DISTINCT pool) >= 3", cfgs)}
+    # ферма — как в движке: торговал в 3+ пулах кластера, и это не меньше 80% всех пулов,
+    # где кошелёк торговал во всей базе (иначе это общий бот, покупающий все новые токены)
+    in_cluster = dict(db.execute(
+        f"SELECT fee_payer, COUNT(DISTINCT pool) FROM swaps WHERE config IN ({ph}) GROUP BY fee_payer HAVING COUNT(DISTINCT pool) >= 3", cfgs))
+    farm = set()
+    if in_cluster:
+        wph = ",".join("?" * len(in_cluster))
+        for w, total_pools in db.execute(
+                f"SELECT fee_payer, COUNT(DISTINCT pool) FROM swaps WHERE fee_payer IN ({wph}) GROUP BY fee_payer", list(in_cluster)):
+            if in_cluster[w] >= 0.8 * total_pools:
+                farm.add(w)
+    bots = len(in_cluster) - len(farm)
     linked |= farm
-    print(f"cluster #{CLUSTER}: {len(cfgs)} configs, {len(linked)} linked addresses ({len(farm)} farm wallets); RPC host {RPC_HOST}")
+    print(f"cluster #{CLUSTER}: {len(cfgs)} configs, {len(linked)} linked addresses ({len(farm)} farm wallets; "
+          f"{bots} wallets active in 3+ cluster pools but mostly elsewhere treated as external); RPC host {RPC_HOST}")
 
     now = int(time.time())
     if TOKENS:
