@@ -28,6 +28,10 @@ VERBOSE = "-v" in sys.argv
 ARGS = [a for a in sys.argv[1:] if a != "-v"]
 N = int(ARGS[0]) if ARGS and ARGS[0].isdigit() else 20
 GROUPS = [a for a in ARGS if "=" in a]
+IPFS_GATEWAYS = ("https://ipfs.io/ipfs/", "https://dweb.link/ipfs/", "https://gateway.pinata.cloud/ipfs/",
+                 "https://nftstorage.link/ipfs/")
+# управляющие и невидимые символы: смена направления текста, нулевой ширины
+SUSPICIOUS_CHARS = {chr(c) for c in list(range(0x202A, 0x202F)) + list(range(0x2066, 0x206A)) + [0x200B, 0x200C, 0x200D, 0x200E, 0x200F, 0xFEFF]}
 PLATFORM_KEYS = ("createdOn", "created_on", "platform", "launchpad", "source", "createdBy", "created_by")
 
 
@@ -55,16 +59,24 @@ def post(body):
 
 
 def fetch_json(uri):
+    """JSON метаданных; для IPFS — по очереди через несколько шлюзов."""
     if not uri:
         return None
     if uri.startswith("ipfs://"):
-        uri = "https://ipfs.io/ipfs/" + uri[len("ipfs://"):]
-    try:
-        req = urllib.request.Request(uri, headers={"User-Agent": "dbc-radar"})
-        with urllib.request.urlopen(req, timeout=8) as r:
-            return json.loads(r.read(200_000))
-    except Exception:  # noqa: BLE001
-        return None
+        cands = [g + uri[len("ipfs://"):] for g in IPFS_GATEWAYS]
+    elif "/ipfs/" in uri:
+        cid = uri.split("/ipfs/", 1)[1]
+        cands = [uri] + [g + cid for g in IPFS_GATEWAYS if not uri.startswith(g)]
+    else:
+        cands = [uri]
+    for u in cands:
+        try:
+            req = urllib.request.Request(u, headers={"User-Agent": "dbc-radar"})
+            with urllib.request.urlopen(req, timeout=12) as r:
+                return json.loads(r.read(200_000))
+        except Exception:  # noqa: BLE001
+            continue
+    return None
 
 
 def domain(url):
@@ -123,7 +135,7 @@ def main():
             continue
         assets = post({"jsonrpc": "2.0", "id": 1, "method": "getAssetBatch", "params": {"ids": mints}}).get("result") or []
         uri_dom, platforms, link_doms, names = collections.Counter(), collections.Counter(), collections.Counter(), []
-        no_links = no_json = 0
+        no_links = no_json = suspicious = 0
         print(f"\n== {g}: {len(mints)} tokens")
         for a in assets:
             if not a:
@@ -140,19 +152,23 @@ def main():
             platforms[domain(plat) or plat or "-"] += 1
             links = []
             urls_in({k: v for k, v in j.items() if k not in PLATFORM_KEYS}, links)
+            urls_in(content.get("links") or {}, links)  # ссылки, которые Helius извлёк из JSON
+            if any(ch in SUSPICIOUS_CHARS for ch in str(meta.get("name", "")) + str(meta.get("symbol", ""))):
+                suspicious += 1
             doms = sorted({domain(u) for u in links if domain(u)})
             for d in doms:
                 link_doms[d] += 1
             if not doms:
                 no_links += 1
-            names.append(f"{meta.get('symbol', '')}")
+            names.append(repr(meta.get("symbol", ""))[1:-1])  # управляющие символы видны как \u202e
             if VERBOSE:
                 print(f"  {a.get('id', '')[:8]}  {meta.get('symbol', '')[:12]:<12} {meta.get('name', '')[:24]:<24} "
                       f"uri@{domain(uri) or '-':<22} platform {plat[:30] or '-':<30} links {', '.join(doms)[:60]}")
         print(f"  metadata hosted at: {uri_dom.most_common(5)}")
         print(f"  platform field:     {platforms.most_common(5)}")
         print(f"  link domains:       {link_doms.most_common(8)}")
-        print(f"  without links: {no_links}, metadata JSON unavailable: {no_json}")
+        print(f"  without links: {no_links}, metadata JSON unavailable: {no_json}, "
+              f"names/symbols with invisible or direction-control characters: {suspicious}")
         print(f"  symbols: {', '.join(names[:15])}")
 
 
