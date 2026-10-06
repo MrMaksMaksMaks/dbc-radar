@@ -7,9 +7,10 @@
     (-v: печатать каждую транзакцию после завершения кривой)
 
 Для выборки выпустившихся пулов кластера:
-  * загружается история транзакций токена (минта) после времени graduation — так видна вся
-    активность после миграции на любой площадке (DAMM v2, роутеры, вывод ликвидности),
-    без поиска адреса пула (DexScreener не показывает пулы, из которых выведена ликвидность);
+  * по истории токена (минта) после graduation находится пул DAMM v2 (аккаунт программы DAMM v2
+    в первой его транзакции), затем загружается полная история пула: создание при миграции,
+    выводы ликвидности, свопы (в истории минта часть транзакций отсутствует — минт бывает
+    в lookup-таблице; DexScreener не показывает пулы, из которых выведена ликвидность);
   * по каждой транзакции считается изменение SOL (включая wSOL) и токена у подписанта:
     покупка, продажа, добавление или вывод ликвидности;
   * подписанты делятся на связанных (создатели пулов кластера, получатели комиссий и остатка,
@@ -107,10 +108,25 @@ def signatures_after(address, since):
 
 
 def uses(tx, program):
+    return program in tx_keys(tx)
+
+
+def tx_keys(tx):
     keys = list(tx["transaction"]["message"]["accountKeys"])
     loaded = tx["meta"].get("loadedAddresses") or {}
-    keys += loaded.get("writable", []) + loaded.get("readonly", [])
-    return program in keys
+    return keys + loaded.get("writable", []) + loaded.get("readonly", [])
+
+
+def find_damm_pool(tx):
+    """Пул DAMM v2 в транзакции: единственный аккаунт, принадлежащий программе DAMM v2."""
+    for k in tx_keys(tx):
+        if k in (DAMM_V2, DBC, WSOL):
+            continue
+        info = rpc("getAccountInfo", [k, {"encoding": "base64", "dataSlice": {"offset": 0, "length": 0}}])
+        v = (info or {}).get("value")
+        if v and v.get("owner") == DAMM_V2 and v.get("space", 0) >= 1000:
+            return k
+    return None
 
 
 def deltas(tx, signer, mint):
@@ -172,9 +188,21 @@ def main():
           f"{'linked SOL out':>14}  {'ext buys before/after 1st linked exit':>38}")
     for pool, mint, grad_time in sample:
         try:
-            # с секунды завершения кривой: миграция, вывод ликвидности и первые покупки в DAMM v2
-            # часто идут в той же секунде одним пакетом; сделки на кривой отсеиваются ниже
+            # 1) история минта после завершения кривой — чтобы найти пул DAMM v2;
+            # 2) история самого пула: создание при миграции, выводы ликвидности и свопы
+            #    (в истории минта часть транзакций отсутствует: минт бывает в lookup-таблице)
             sigs = signatures_after(mint, grad_time)[:MAX_TX]
+            damm = None
+            for s0 in sigs:
+                tx0 = rpc("getTransaction", [s0["signature"], {"encoding": "json", "maxSupportedTransactionVersion": 0}])
+                if tx0 and uses(tx0, DAMM_V2):
+                    damm = find_damm_pool(tx0)
+                    if damm:
+                        break
+            if damm:
+                sigs = signatures_after(damm, grad_time - 600)[:MAX_TX]
+            if VERBOSE:
+                print(f"  {mint[:8]}: DAMM v2 pool {damm or 'not found'}; {len(sigs)} transactions")
         except Exception as e:  # noqa: BLE001
             print(f"{mint[:8]:<10} rpc error: {e}")
             continue
@@ -194,7 +222,7 @@ def main():
             t = tx.get("blockTime") or 0
             if VERBOSE:
                 progs = "+".join(n for n, f in (("DBC", in_dbc), ("DAMM", in_damm)) if f) or "-"
-                print(f"    t+{t - grad_time:>6}s  {s['signature'][:10]}  {signer[:8]} {'L' if signer in linked else 'E'}  "
+                print(f"    t{t - grad_time:>+7}s  {s['signature'][:10]}  {signer[:8]} {'L' if signer in linked else 'E'}  "
                       f"{progs:<8}  SOL {sol / 1e9:+9.4f}  token {tok:+d}  {k}")
             if in_dbc and not in_damm:
                 continue  # сделка на кривой DBC в секунду завершения, не после миграции
