@@ -29,6 +29,7 @@ MAX_TX = int(sys.argv[3]) if len(sys.argv) > 3 else 150
 RPS = 4.0
 MIN_SOL = 5_000_000  # 0,005 SOL: меньшие изменения — комиссии сети и рента, а не сделка
 DAMM_V2 = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG"
+DBC = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN"
 WSOL = "So11111111111111111111111111111111111111112"
 B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
@@ -168,8 +169,9 @@ def main():
           f"{'linked SOL out':>14}  {'ext buys before/after 1st linked exit':>38}")
     for pool, mint, grad_time in sample:
         try:
-            # +1 с: сделки на кривой в секунду завершения не считаются
-            sigs = signatures_after(mint, grad_time + 1)[:MAX_TX]
+            # с секунды завершения кривой: миграция, вывод ликвидности и первые покупки в DAMM v2
+            # часто идут в той же секунде одним пакетом; сделки на кривой отсеиваются ниже
+            sigs = signatures_after(mint, grad_time)[:MAX_TX]
         except Exception as e:  # noqa: BLE001
             print(f"{mint[:8]:<10} rpc error: {e}")
             continue
@@ -182,7 +184,10 @@ def main():
             if not tx:
                 continue
             signer = tx["transaction"]["message"]["accountKeys"][0]
-            damm_tx += uses(tx, DAMM_V2)
+            in_damm = uses(tx, DAMM_V2)
+            if uses(tx, DBC) and not in_damm:
+                continue  # сделка на кривой DBC в секунду завершения, не после миграции
+            damm_tx += in_damm
             sol, tok = deltas(tx, signer, mint)
             k = kind(sol, tok)
             t = tx.get("blockTime") or 0
@@ -214,6 +219,7 @@ def main():
               f"net left by externals {total['ext_in'] - total['ext_out']:.3f} SOL "
               f"({(total['ext_in'] - total['ext_out']) / n:.3f} per pool); linked SOL out {total['linked_out']:.3f}")
     print("notes: tx = transactions of the token after graduation (any venue); damm = of them touching DAMM v2;"
+          "\n       history starts at the curve-completion second; DBC-only transactions (curve trades) are skipped;"
           "\n       changes under 0.005 SOL are treated as fees or transfers, not trades;"
           "\n       SOL changes include network fees and rent; 'linked SOL out' includes the operator's own liquidity withdrawals"
           "\n       (mostly its own SOL from the curve), so compare it with what externals left, not with zero.")
