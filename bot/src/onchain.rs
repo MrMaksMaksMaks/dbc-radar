@@ -245,34 +245,55 @@ impl Rpc {
         Ok(MintOrigin::Unknown)
     }
 
+    /// Дешёвое определение адреса — один getAccountInfo, без поиска по истории.
+    /// Some — ответ известен (пул DBC, пул DAMM v2 / DLMM, не DBC);
+    /// None — это токен, и для поиска его пула нужна история транзакций (resolve).
+    pub async fn resolve_cheap(&self, addr: &str) -> Result<Option<Lookup>> {
+        let Some((owner, data)) = self.account(addr).await? else { return Ok(Some(Lookup::NotDbc)) };
+        Ok(classify(addr, &owner, &data))
+    }
+
     /// Найти пул DBC по адресу пула или токена (или пула Meteora, где торгуется токен).
     pub async fn resolve(&self, addr: &str) -> Result<Lookup> {
         let Some((owner, data)) = self.account(addr).await? else { return Ok(Lookup::NotDbc) };
-        if owner == DBC_PROGRAM_ID {
-            return Ok(parse_pool_account(addr, &data).map(Lookup::Found).unwrap_or(Lookup::NotDbc));
+        if let Some(l) = classify(addr, &owner, &data) {
+            return Ok(l);
         }
-        if owner == DAMM_V2_PROGRAM {
-            return Ok(pair_mint(&data, DAMM_V2_POOL_DISC, DAMM_V2_MINTS)
-                .map(|mint| Lookup::MeteoraPool { venue: "DAMM v2", mint })
-                .unwrap_or(Lookup::NotDbc));
-        }
-        if owner == DLMM_PROGRAM {
-            return Ok(pair_mint(&data, DLMM_PAIR_DISC, DLMM_MINTS)
-                .map(|mint| Lookup::MeteoraPool { venue: "DLMM", mint })
-                .unwrap_or(Lookup::NotDbc));
-        }
-        if TOKEN_PROGRAMS.contains(&owner.as_str()) {
-            return Ok(match self.pool_by_mint(addr).await? {
-                MintOrigin::Dbc(p) => Lookup::Found(p),
-                MintOrigin::Launchpad(name) => Lookup::OtherLaunchpad(name, false),
-                MintOrigin::Unknown => match launchpad_by_suffix(addr) {
-                    Some(name) => Lookup::OtherLaunchpad(name, true),
-                    None => Lookup::MintWithoutHistory,
-                },
-            });
-        }
-        Ok(Lookup::NotDbc)
+        // токен: самая ранняя транзакция через HISTORY_RPC_URL
+        Ok(match self.pool_by_mint(addr).await? {
+            MintOrigin::Dbc(p) => Lookup::Found(p),
+            MintOrigin::Launchpad(name) => Lookup::OtherLaunchpad(name, false),
+            MintOrigin::Unknown => match launchpad_by_suffix(addr) {
+                Some(name) => Lookup::OtherLaunchpad(name, true),
+                None => Lookup::MintWithoutHistory,
+            },
+        })
     }
+}
+
+/// Что за адрес — по владельцу и данным аккаунта. None — токен (нужен поиск по истории).
+fn classify(addr: &str, owner: &str, data: &[u8]) -> Option<Lookup> {
+    if owner == DBC_PROGRAM_ID {
+        return Some(parse_pool_account(addr, data).map(Lookup::Found).unwrap_or(Lookup::NotDbc));
+    }
+    if owner == DAMM_V2_PROGRAM {
+        return Some(
+            pair_mint(data, DAMM_V2_POOL_DISC, DAMM_V2_MINTS)
+                .map(|mint| Lookup::MeteoraPool { venue: "DAMM v2", mint })
+                .unwrap_or(Lookup::NotDbc),
+        );
+    }
+    if owner == DLMM_PROGRAM {
+        return Some(
+            pair_mint(data, DLMM_PAIR_DISC, DLMM_MINTS)
+                .map(|mint| Lookup::MeteoraPool { venue: "DLMM", mint })
+                .unwrap_or(Lookup::NotDbc),
+        );
+    }
+    if TOKEN_PROGRAMS.contains(&owner) {
+        return None;
+    }
+    Some(Lookup::NotDbc)
 }
 
 enum MintOrigin {

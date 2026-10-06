@@ -5,7 +5,9 @@
 //!   GET /v1/latest?hours=2&limit=20   — последние запуски с вердиктами RED / RED-LINK / AMBER
 //!   GET /v1/stats                     — запуски за 24 часа по вердиктам
 //!
-//! Адреса из базы отдаются всем. Поиск неизвестных адресов через RPC расходует лимиты
+//! Адреса из базы отдаются всем. Без ключа также работает дешёвая проверка по одному аккаунту:
+//! адрес пула DAMM v2 / DLMM определяется в токен, и если токен есть в базе — отдаётся его вердикт.
+//! Поиск неизвестных пулов и токенов через RPC (включая историю транзакций) расходует лимиты
 //! провайдеров, поэтому доступен только с ключом (заголовок `X-API-Key`).
 //! Без ключа из ответа /v1/check убираются адреса создателя и получателей
 //! (launch.creator, config.top_creator, config.fee_claimer, config.leftover_receiver).
@@ -27,6 +29,8 @@ use tokio::sync::Mutex;
 
 use crate::onchain::{self, Lookup};
 use crate::store::{self, now, State};
+
+const NOT_INDEXED: &str = "address is not in the index; on-chain lookup requires an API key (X-API-Key)";
 
 #[derive(Clone)]
 struct Api {
@@ -202,6 +206,43 @@ async fn found_json(app: &State, f: &onchain::FoundPool) -> Value {
     from_db(app, &f.pool).await.unwrap_or(json!({"kind": "unknown", "error": "not_found"}))
 }
 
+/// Проверка без ключа для адреса, которого нет в базе: только один getAccountInfo.
+/// Пул DAMM v2 / DLMM → его токен → вердикт из базы (если токен там есть).
+async fn public_lookup(api: &Api, addr: &str) -> Response {
+    match api.app.rpc.resolve_cheap(addr).await {
+        Ok(Some(Lookup::MeteoraPool { venue, mint })) => {
+            let via = json!({"venue": venue, "pool": addr});
+            if let Some(mut v) = from_db(&api.app, &mint).await {
+                redact(&mut v);
+                v["via"] = via;
+                return Json(v).into_response();
+            }
+            if let Some(lp) = onchain::launchpad_by_suffix(&mint) {
+                return Json(json!({
+                    "kind": "token", "dbc": false, "launchpad": lp,
+                    "inferred_from_address": true, "token": mint, "via": via,
+                }))
+                .into_response();
+            }
+            err(
+                StatusCode::NOT_FOUND,
+                "not_indexed",
+                "the token of this pool is not in the index; on-chain lookup requires an API key (X-API-Key)",
+            )
+        }
+        Ok(Some(Lookup::NotDbc)) => err(StatusCode::NOT_FOUND, "not_dbc", "not a Meteora DBC pool, token or config"),
+        // токен: поиск его пула по истории — только с ключом; лаунчпад по окончанию адреса — бесплатно
+        Ok(None) => match onchain::launchpad_by_suffix(addr) {
+            Some(lp) => Json(json!({"kind": "token", "dbc": false, "launchpad": lp, "inferred_from_address": true}))
+                .into_response(),
+            None => err(StatusCode::NOT_FOUND, "not_indexed", NOT_INDEXED),
+        },
+        // пул DBC, которого нет в базе: запись в базу — только с ключом
+        Ok(Some(_)) => err(StatusCode::NOT_FOUND, "not_indexed", NOT_INDEXED),
+        Err(e) => err(StatusCode::BAD_GATEWAY, "rpc_error", &e.to_string()),
+    }
+}
+
 async fn check(
     AxState(api): AxState<Api>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -222,13 +263,9 @@ async fn check(
         return Json(v).into_response();
     }
     if !key_ok {
-        return err(
-            StatusCode::NOT_FOUND,
-            "not_indexed",
-            "address is not in the index; on-chain lookup requires an API key (X-API-Key)",
-        );
+        return public_lookup(&api, &addr).await;
     }
-    // дальше только запросы с валидным ключом: адреса не скрываются
+    // дальше только запросы с валидным ключом: полный поиск, адреса не скрываются
     let v = match api.app.rpc.resolve(&addr).await {
         Ok(Lookup::Found(f)) => found_json(&api.app, &f).await,
         Ok(Lookup::MeteoraPool { venue, mint }) => {
