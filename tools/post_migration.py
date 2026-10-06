@@ -59,7 +59,10 @@ def env(key, default):
     return default
 
 
-RPC = env("RPC_URL", "https://solana-rpc.publicnode.com")
+# нужна полная история: публичные узлы (PublicNode) хранят историю адресов лишь 1–2 суток,
+# поэтому сначала HISTORY_RPC_URL (Helius), иначе RPC_URL
+RPC = env("HISTORY_RPC_URL", env("RPC_URL", "https://solana-rpc.publicnode.com"))
+RPC_HOST = RPC.split("://", 1)[-1].split("/", 1)[0].split("?", 1)[0]  # без ключа — для вывода
 _last = [0.0]
 
 
@@ -174,7 +177,7 @@ def main():
     farm = {r[0] for r in db.execute(
         f"SELECT fee_payer FROM swaps WHERE config IN ({ph}) GROUP BY fee_payer HAVING COUNT(DISTINCT pool) >= 3", cfgs)}
     linked |= farm
-    print(f"cluster #{CLUSTER}: {len(cfgs)} configs, {len(linked)} linked addresses ({len(farm)} farm wallets); RPC {RPC}")
+    print(f"cluster #{CLUSTER}: {len(cfgs)} configs, {len(linked)} linked addresses ({len(farm)} farm wallets); RPC host {RPC_HOST}")
 
     now = int(time.time())
     sample = db.execute(
