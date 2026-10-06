@@ -32,7 +32,7 @@ const BATCH: usize = 100;
 
 pub async fn run(app: Arc<App>, every_secs: u64, window_secs: i64) {
     loop {
-        match sweep(&app.rpc, &app.db, window_secs).await {
+        match sweep(&app.status_rpc, &app.db, window_secs).await {
             Ok((checked, found)) if found > 0 => {
                 tracing::info!(checked, found, "graduations found from pool accounts")
             }

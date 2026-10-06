@@ -9,6 +9,9 @@ use std::collections::HashSet;
 
 pub struct App {
     pub rpc: Rpc,
+    /// RPC для проверки graduation по аккаунтам (getMultipleAccounts): отдельный узел и лимит,
+    /// чтобы не отнимать запросы у загрузки свопов
+    pub status_rpc: Rpc,
     pub db: Db,
     /// websocket-адреса для обнаружения пулов (работают параллельно, дубликаты отсекаются)
     pub ws_urls: Vec<String>,

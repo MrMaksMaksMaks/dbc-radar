@@ -59,6 +59,9 @@ async fn main() -> Result<()> {
     // проверка graduation по аккаунтам: как часто и за сколько часов назад
     let grad_check_secs: u64 = env_or("GRAD_CHECK_SECS", "120").parse().context("GRAD_CHECK_SECS")?;
     let grad_check_hours: i64 = env_or("GRAD_CHECK_HOURS", "24").parse().context("GRAD_CHECK_HOURS")?;
+    // отдельный узел для этой проверки (у PublicNode предел ~6 адресов на getMultipleAccounts)
+    let status_rpc_url = env_or("STATUS_RPC_URL", &rpc_url);
+    let status_rps: f64 = env_or("STATUS_RPC_RPS", "2").parse().context("STATUS_RPC_RPS")?;
     let config_allowlist: HashSet<String> = env_or("CONFIG_ALLOWLIST", "")
         .split(',')
         .map(str::trim)
@@ -100,15 +103,17 @@ async fn main() -> Result<()> {
     // пулов, созданных за последние <hours> часов (например, для старых данных).
     if args.get(1).map(String::as_str) == Some("grad-sweep") {
         let hours: i64 = args.get(2).context("usage: dbc-collector grad-sweep <hours>")?.parse().context("hours")?;
-        let rpc = rpc::Rpc::new(rpc_url, rps);
+        let rpc = rpc::Rpc::new(status_rpc_url, status_rps);
         let db = db::Db::open(&db_path)?;
         let (checked, found) = status::sweep(&rpc, &db, hours * 3600).await?;
         println!("checked {checked} pools without graduation, found {found} graduated");
         return Ok(());
     }
 
+    tracing::info!(%status_rpc_url, status_rps, "graduation check from pool accounts");
     let app = Arc::new(app::App {
         rpc: rpc::Rpc::new(rpc_url, rps),
+        status_rpc: rpc::Rpc::new(status_rpc_url, status_rps),
         db: db::Db::open(&db_path)?,
         ws_urls,
         ws_stall_secs,
