@@ -6,8 +6,9 @@
     python3 post_migration.py [cluster_id] [pools] [max_tx_per_pool]
 
 Для выборки выпустившихся пулов кластера:
-  * пул DAMM v2 токена ищется через API DexScreener;
-  * транзакции пула загружаются через RPC (RPC_URL из .env);
+  * загружается история транзакций токена (минта) после времени graduation — так видна вся
+    активность после миграции на любой площадке (DAMM v2, роутеры, вывод ликвидности),
+    без поиска адреса пула (DexScreener не показывает пулы, из которых выведена ликвидность);
   * по каждой транзакции считается изменение SOL (включая wSOL) и токена у подписанта:
     покупка, продажа, добавление или вывод ликвидности;
   * подписанты делятся на связанных (создатели пулов кластера, получатели комиссий и остатка,
@@ -26,6 +27,8 @@ CLUSTER = sys.argv[1] if len(sys.argv) > 1 else "5"
 SAMPLE = int(sys.argv[2]) if len(sys.argv) > 2 else 15
 MAX_TX = int(sys.argv[3]) if len(sys.argv) > 3 else 150
 RPS = 4.0
+MIN_SOL = 5_000_000  # 0,005 SOL: меньшие изменения — комиссии сети и рента, а не сделка
+DAMM_V2 = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG"
 WSOL = "So11111111111111111111111111111111111111112"
 B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
@@ -79,11 +82,31 @@ def rpc(method, params):
     return v.get("result")
 
 
-def damm_pool(mint, dbc_pool):
-    v = http_json(f"https://api.dexscreener.com/latest/dex/tokens/{mint}") or {}
-    pairs = [p for p in (v.get("pairs") or []) if p.get("dexId") == "meteora" and p.get("pairAddress") != dbc_pool]
-    pairs.sort(key=lambda p: ("DYN2" not in (p.get("labels") or []), p.get("pairCreatedAt") or 0))
-    return pairs[0]["pairAddress"] if pairs else None
+def signatures_after(address, since):
+    """Успешные транзакции адреса не раньше `since`, от старых к новым (до 3 страниц по 1000)."""
+    out, before = [], None
+    for _ in range(3):
+        opts = {"limit": 1000}
+        if before:
+            opts["before"] = before
+        page = rpc("getSignaturesForAddress", [address, opts]) or []
+        if not page:
+            break
+        for s in page:
+            if (s.get("blockTime") or 0) >= since and s.get("err") is None:
+                out.append(s)
+        if (page[-1].get("blockTime") or 0) < since or len(page) < 1000:
+            break
+        before = page[-1]["signature"]
+    out.reverse()
+    return out
+
+
+def uses(tx, program):
+    keys = list(tx["transaction"]["message"]["accountKeys"])
+    loaded = tx["meta"].get("loadedAddresses") or {}
+    keys += loaded.get("writable", []) + loaded.get("readonly", [])
+    return program in keys
 
 
 def deltas(tx, signer, mint):
@@ -100,6 +123,8 @@ def deltas(tx, signer, mint):
 
 
 def kind(sol, tok):
+    if abs(sol) < MIN_SOL:
+        return "transfer" if tok else "other"
     if tok > 0 and sol < 0:
         return "buy"
     if tok < 0 and sol > 0:
@@ -108,7 +133,7 @@ def kind(sol, tok):
         return "remove_liq"
     if tok < 0 and sol < 0:
         return "add_liq"
-    return "other"
+    return "sol_only"
 
 
 def main():
@@ -139,20 +164,17 @@ def main():
         cfgs + [now - 5 * 86400, now - 86400, SAMPLE]).fetchall()
 
     total = defaultdict(float)
-    print(f"\n{'token':<10} {'DAMM v2':<10} {'tx':>4}  {'ext buys':>8} {'ext SOL in':>10} {'ext SOL out':>11}  "
+    print(f"\n{'token':<10} {'tx':>4} {'damm':>4}  {'ext buys':>8} {'ext SOL in':>10} {'ext SOL out':>11}  "
           f"{'linked SOL out':>14}  {'ext buys before/after 1st linked exit':>38}")
     for pool, mint, grad_time in sample:
         try:
-            damm = damm_pool(mint, pool)
+            # +1 с: сделки на кривой в секунду завершения не считаются
+            sigs = signatures_after(mint, grad_time + 1)[:MAX_TX]
         except Exception as e:  # noqa: BLE001
-            print(f"{mint[:8]:<10} dexscreener error: {e}")
+            print(f"{mint[:8]:<10} rpc error: {e}")
             continue
-        if not damm:
-            print(f"{mint[:8]:<10} no DAMM v2 pool found")
-            continue
-        sigs = rpc("getSignaturesForAddress", [damm, {"limit": 1000}]) or []
-        sigs = [s for s in reversed(sigs) if s.get("err") is None][:MAX_TX]
         st = defaultdict(float)
+        damm_tx = 0
         first_exit = None
         buys = []  # время внешних покупок
         for s in sigs:
@@ -160,6 +182,7 @@ def main():
             if not tx:
                 continue
             signer = tx["transaction"]["message"]["accountKeys"][0]
+            damm_tx += uses(tx, DAMM_V2)
             sol, tok = deltas(tx, signer, mint)
             k = kind(sol, tok)
             t = tx.get("blockTime") or 0
@@ -181,7 +204,7 @@ def main():
         total["buys"] += len(buys)
         total["pools"] += 1
         trunc = "+" if len(sigs) >= MAX_TX else ""
-        print(f"{mint[:8]:<10} {damm[:8]:<10} {len(sigs):>3}{trunc:<1}  {len(buys):>8} {st['ext_in']:>10.3f} {st['ext_out']:>11.3f}  "
+        print(f"{mint[:8]:<10} {len(sigs):>3}{trunc:<1} {damm_tx:>4}  {len(buys):>8} {st['ext_in']:>10.3f} {st['ext_out']:>11.3f}  "
               f"{st['linked_out']:>14.3f}  {before:>18} / {after}")
 
     if total["pools"]:
@@ -190,7 +213,9 @@ def main():
               f"external SOL in {total['ext_in']:.3f}, out {total['ext_out']:.3f}, "
               f"net left by externals {total['ext_in'] - total['ext_out']:.3f} SOL "
               f"({(total['ext_in'] - total['ext_out']) / n:.3f} per pool); linked SOL out {total['linked_out']:.3f}")
-    print("notes: SOL changes include network fees and rent; 'linked SOL out' includes the operator's own liquidity withdrawals"
+    print("notes: tx = transactions of the token after graduation (any venue); damm = of them touching DAMM v2;"
+          "\n       changes under 0.005 SOL are treated as fees or transfers, not trades;"
+          "\n       SOL changes include network fees and rent; 'linked SOL out' includes the operator's own liquidity withdrawals"
           "\n       (mostly its own SOL from the curve), so compare it with what externals left, not with zero.")
 
 
