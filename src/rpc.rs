@@ -118,13 +118,18 @@ impl Rpc {
     }
 
     /// Аккаунты пачкой (до 100 адресов): для каждого (владелец, данные) или None, если аккаунта нет.
-    pub async fn get_multiple_accounts(&self, keys: &[String]) -> Result<Vec<Option<(String, Vec<u8>)>>> {
-        let res = self
-            .call(
-                "getMultipleAccounts",
-                json!([keys, {"encoding": "base64", "commitment": "confirmed"}]),
-            )
-            .await?;
+    /// `slice` = (offset, length) — читать только часть данных (меньше ответ; публичные узлы
+    /// отклоняют слишком большие запросы).
+    pub async fn get_multiple_accounts(
+        &self,
+        keys: &[String],
+        slice: Option<(usize, usize)>,
+    ) -> Result<Vec<Option<(String, Vec<u8>)>>> {
+        let mut cfg = json!({"encoding": "base64", "commitment": "confirmed"});
+        if let Some((offset, length)) = slice {
+            cfg["dataSlice"] = json!({"offset": offset, "length": length});
+        }
+        let res = self.call("getMultipleAccounts", json!([keys, cfg])).await?;
         let arr = res.get("value").and_then(Value::as_array).cloned().unwrap_or_default();
         if arr.len() != keys.len() {
             bail!("getMultipleAccounts: {} accounts for {} keys", arr.len(), keys.len());
