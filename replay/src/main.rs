@@ -460,8 +460,10 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
             continue;
         }
         let scope: Vec<String> = c.members.iter().map(|&m| rows[m].config.clone()).collect();
+        // сделки кластера загружаются один раз, метрики считаются для каждого конфига по ним
+        let data = farm::load_scope(conn, &scope)?;
         for &m in &c.members {
-            let fs = farm::analyze_scope(conn, &scope, &[rows[m].config.clone()], &widx, 0)?;
+            let fs = farm::analyze_loaded(&data, &[rows[m].config.clone()], &widx, 0);
             let r = &mut rows[m];
             r.beh.farm = if fs.pools > 0 { Some(fs) } else { None };
             r.rep = risk::score(&r.facts, &r.beh);
@@ -1022,16 +1024,17 @@ fn run_damage(conn: &rusqlite::Connection, args: &Args) -> Result<()> {
         } else {
             Vec::new()
         };
+        // сделки кластера загружаются один раз на кластер
+        let data = if scope.is_empty() { None } else { Some(farm::load_scope(conn, &scope)?) };
         for &i in &c.members {
             let r = &a.rows[i];
             if r.beh.top_creator_pools > best {
                 best = r.beh.top_creator_pools;
                 g.creator = r.beh.top_creator.clone().unwrap_or_default();
             }
-            let fs = if scope.is_empty() {
-                farm::analyze_config(conn, &r.config, &widx, cutoff)?
-            } else {
-                farm::analyze_scope(conn, &scope, &[r.config.clone()], &widx, cutoff)?
+            let fs = match &data {
+                None => farm::analyze_config(conn, &r.config, &widx, cutoff)?,
+                Some(d) => farm::analyze_loaded(d, &[r.config.clone()], &widx, cutoff),
             };
             g.pools += fs.pools;
             g.active += fs.active_pools;

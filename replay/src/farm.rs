@@ -164,6 +164,15 @@ pub fn analyze_scope(
     idx: &WalletIndex,
     metrics_since: i64,
 ) -> Result<FarmStats> {
+    let data = load_scope(conn, scope)?;
+    Ok(analyze_loaded(&data, metrics, idx, metrics_since))
+}
+
+/// Пулы и сделки области (кластера), загруженные один раз: по ним считаются метрики
+/// каждого конфига кластера без повторного чтения базы.
+pub struct ScopeData(Vec<PoolData>);
+
+pub fn load_scope(conn: &Connection, scope: &[String]) -> Result<ScopeData> {
     let mut st = conn.prepare_cached(
         "SELECT p.pool, p.creator, p.created_time, p.created_slot,
                 (SELECT block_time FROM curve_complete c WHERE c.pool = p.pool), p.config
@@ -176,7 +185,6 @@ pub fn analyze_scope(
             .collect::<std::result::Result<_, _>>()?;
         heads.extend(rows);
     }
-    let metric_set: HashSet<&str> = metrics.iter().map(String::as_str).collect();
 
     let mut sw = conn.prepare_cached(
         "SELECT fee_payer, trade_direction, included_fee_input_amount, output_amount, slot
@@ -199,11 +207,18 @@ pub fn analyze_scope(
             pools.push(PoolData { config, creator, created_time, created_slot, graduated_time, swaps });
         }
     }
+    Ok(ScopeData(pools))
+}
+
+/// Ферма и метрики по уже загруженной области; `metrics` — конфиги, для которых считаются метрики.
+pub fn analyze_loaded(data: &ScopeData, metrics: &[String], idx: &WalletIndex, metrics_since: i64) -> FarmStats {
+    let pools = &data.0;
+    let metric_set: HashSet<&str> = metrics.iter().map(String::as_str).collect();
 
     let n = pools.len();
     let mut out = FarmStats::default();
     if n == 0 {
-        return Ok(out);
+        return out;
     }
 
     // --- Определение фермы (по всем отслеживаемым пулам конфига) ---
@@ -218,7 +233,7 @@ pub fn analyze_scope(
     let mut dev_buys: Vec<u64> = Vec::new();
     // первые покупки не от создателя (до 5 на пул): кошелёк и сумма, по порядку
     let mut opening: Vec<Vec<(&str, u64)>> = Vec::with_capacity(n);
-    for p in &pools {
+    for p in pools.iter() {
         let buyers: HashSet<&str> = p.swaps.iter().filter(|s| s.buy).map(|s| s.wallet.as_str()).collect();
         let mut seen: HashSet<&str> = HashSet::new();
         let mut early: HashSet<&str> = HashSet::new();
@@ -366,7 +381,7 @@ pub fn analyze_scope(
     out.median_migration_secs = median(mig);
     out.median_linked_share = if shares.len() >= MIN_POOLS.min(out.pools.max(1)) { median(shares) } else { None };
     out.median_fanout = median(fanouts);
-    Ok(out)
+    out
 }
 
 #[cfg(test)]
