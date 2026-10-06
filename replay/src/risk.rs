@@ -253,7 +253,7 @@ impl Verdict {
             Verdict::RedLinked => "shares operator addresses with configs where synthetic launches were observed",
             Verdict::RugCapable => "config allows pulling liquidity and dumping a large leftover supply after migration",
             Verdict::SelfGraduation => "instant / self-funded graduation: no real bonding-curve market; risk moves to the post-migration DAMM v2 pool",
-            Verdict::Standard => "no red flags in config or observed behaviour",
+            Verdict::Standard => "no major red flags in config or observed behaviour",
         }
     }
 }
@@ -318,8 +318,24 @@ pub fn score(f: &ConfigFacts, b: &Behavior) -> Report {
     if vest > 0 && vest + lp.locked < 50 && lp.vest_full_release_secs <= 7 * 86_400 {
         add(&mut cap, 5, format!("vested {}% of liquidity fully unlocks {} after migration", vest, human_secs(lp.vest_full_release_secs)));
     }
-    if f.migration_fee_pct >= 10 {
-        add(&mut cap, 10, format!("migration fee takes {}% of the collected quote", f.migration_fee_pct));
+    // Комиссия миграции забирает эту долю SOL, собранных на кривой: в пул после миграции уходит
+    // только остаток (PoolConfig::get_migration_quote_amount). При 50%+ покупатели теряют
+    // большую часть ликвидности в момент graduation — это само по себе рискованный конфиг.
+    let fee = f.migration_fee_pct;
+    if fee >= 10 {
+        let points = match fee {
+            50.. => 50,
+            25..=49 => 25,
+            _ => 10,
+        };
+        add(
+            &mut cap,
+            points,
+            format!(
+                "migration fee takes {fee}% of the SOL raised on the curve: only {}% goes into the post-migration pool",
+                100 - fee as u32
+            ),
+        );
     }
     if let Some(h) = &f.transfer_hook {
         add(&mut cap, 20, format!(

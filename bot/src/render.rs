@@ -20,7 +20,7 @@ pub fn title(verdict: &str) -> &'static str {
         "RED-LINK" => "Linked to a synthetic-launch operator",
         "AMBER" => "Risky config",
         "SELF-GRAD" => "Instant graduation",
-        "GREEN" => "No red flags",
+        "GREEN" => "No major red flags",
         _ => "Unknown",
     }
 }
@@ -143,7 +143,7 @@ pub fn pool_card(p: &PoolInfo, r: Option<&ConfigRisk>) -> String {
         let mut why: Vec<String> = r.flags("capability_flags").into_iter().take(2).collect();
         why.extend(r.flags("evidence_flags").into_iter().take(3));
         if why.is_empty() {
-            s.push_str(&format!("• {}\n", esc("no red flags in the config or in the operator's other launches")));
+            s.push_str(&format!("• {}\n", esc("no major red flags in the config or in the operator's other launches")));
         } else {
             s.push_str(&bullets(&why, 5));
         }
@@ -285,7 +285,7 @@ pub fn how() -> String {
         esc("RED / RED-LINK — synthetic launches or linked to their operator"),
         esc("AMBER — config allows pulling liquidity and dumping leftover supply"),
         esc("SELF-GRAD — instant graduation, no market on the curve"),
-        esc("GREEN — no red flags")
+        esc("GREEN — no major red flags; minor signals are listed in the report")
     ));
     s
 }

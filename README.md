@@ -24,7 +24,7 @@ The verdict separates good configs from bad ones; it is not a verdict on DBC. We
 
 | Verdict | Meaning |
 |---|---|
-| 🟢 **GREEN** | no red flags in the config or in observed trading |
+| 🟢 **GREEN** | no major red flags in the config or in observed trading (minor signals are still listed) |
 | ⚪ **SELF-GRAD** | instant or self-funded graduation, no real market on the curve |
 | 🟠 **AMBER** | the config allows pulling liquidity and dumping leftover supply; no abuse observed yet |
 | 🔴 **RED** | synthetic launches: trading is dominated by the creator and wallets linked to it |
@@ -97,7 +97,8 @@ Two independent axes, so "what the config allows" is never confused with "what a
 **Capability** — read from the config account, known before the first buy:
 - share of post-migration liquidity the creator or partner can withdraw at once, and how long vesting lasts;
 - share of supply sent to the leftover receiver, and whether that receiver is a launchpad platform address (shared by many configs) or the operator's own;
-- migration fee, mint authority, transfer hooks, instant graduation (migration threshold ≈ 0).
+- migration fee: the share of SOL raised on the curve that is taken at graduation instead of going into the post-migration pool (50% and more makes the config risky on its own);
+- mint authority, transfer hooks, instant graduation (migration threshold ≈ 0).
 
 **Evidence** — observed in tracked pools:
 - **linked volume**: share of curve volume from the creator, fan-out sellers and the operator's wallet farm;
