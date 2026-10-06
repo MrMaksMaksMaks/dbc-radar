@@ -579,7 +579,7 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
                 r.rep.evidence_flags.push(risk::Flag {
                     points: 50,
                     text: format!(
-                        "linked by shared {} to {} config(s) with observed insider selling (operator cluster #{})",
+                        "linked by shared {} to {} config(s) where trading is dominated by creator-linked wallets (operator cluster #{})",
                         labels(&kinds),
                         strong_n + sat_n,
                         c.id
@@ -590,7 +590,7 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
                 r.rep.evidence_flags.push(risk::Flag {
                     points: 0,
                     text: format!(
-                        "shares {}+ selling wallets with {} config(s) with observed insider selling; not enough to flag this config on its own",
+                        "shares {}+ selling wallets with {} config(s) where trading is dominated by creator-linked wallets; not enough to flag this config on its own",
                         cluster::MIN_SHARED_SATELLITES,
                         sat_n
                     ),
@@ -599,7 +599,7 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
                 r.rep.evidence_flags.push(risk::Flag {
                     points: 0,
                     text: format!(
-                        "same launchpad address ({}) as {} config(s) with observed insider selling; a shared platform address is not treated as a link",
+                        "same launchpad address ({}) as {} config(s) where trading is dominated by creator-linked wallets; a shared platform address is not treated as a link",
                         labels(&platform_kinds),
                         platform_n
                     ),
@@ -607,7 +607,7 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
             } else if let Some(n) = red_templates.get(&r.template) {
                 r.rep.evidence_flags.push(risk::Flag {
                     points: 20,
-                    text: format!("identical parameter template to {n} config(s) with observed insider selling"),
+                    text: format!("identical parameter template to {n} config(s) where trading is dominated by creator-linked wallets"),
                 });
             } else {
                 continue;
