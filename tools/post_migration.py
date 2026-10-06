@@ -3,7 +3,7 @@
 
 Запуск из корня репозитория (нужны dbc.sqlite, .env и свежий risk --json):
     replay/target/release/dbc-replay dbc.sqlite risk --json > /tmp/risk_new.json
-    python3 post_migration.py [cluster_id] [pools] [max_tx_per_pool] [-v]
+    python3 post_migration.py [cluster_id] [pools] [max_tx_per_pool] [-v] [--tokens=PREFIX1,PREFIX2]
     (-v: печатать каждую транзакцию после завершения кривой)
 
 Для выборки выпустившихся пулов кластера:
@@ -26,7 +26,9 @@ import urllib.request
 from collections import defaultdict
 
 VERBOSE = "-v" in sys.argv
-ARGS = [a for a in sys.argv[1:] if a != "-v"]
+# --tokens=7Akd4rsT,AwmnQC3U — разобрать конкретные токены (начала адресов минтов)
+TOKENS = next((a.split("=", 1)[1].split(",") for a in sys.argv[1:] if a.startswith("--tokens=")), [])
+ARGS = [a for a in sys.argv[1:] if a != "-v" and not a.startswith("--tokens=")]
 CLUSTER = ARGS[0] if len(ARGS) > 0 else "5"
 SAMPLE = int(ARGS[1]) if len(ARGS) > 1 else 15
 MAX_TX = int(ARGS[2]) if len(ARGS) > 2 else 600
@@ -90,10 +92,10 @@ def rpc(method, params):
     return v.get("result")
 
 
-def signatures_after(address, since):
-    """Успешные транзакции адреса не раньше `since`, от старых к новым (до 3 страниц по 1000)."""
+def signatures_after(address, since, limit=3000):
+    """Успешные транзакции адреса не раньше `since`, от старых к новым (страницами по 1000)."""
     out, before = [], None
-    for _ in range(3):
+    for _ in range(limit // 1000 + 1):
         opts = {"limit": 1000}
         if before:
             opts["before"] = before
@@ -180,20 +182,27 @@ def main():
     print(f"cluster #{CLUSTER}: {len(cfgs)} configs, {len(linked)} linked addresses ({len(farm)} farm wallets); RPC host {RPC_HOST}")
 
     now = int(time.time())
-    sample = db.execute(
-        f"""SELECT p.pool, p.base_mint, c.block_time FROM pools p JOIN curve_complete c ON c.pool = p.pool
+    if TOKENS:
+        sample = []
+        for pre in TOKENS:
+            sample += db.execute(
+                """SELECT p.pool, p.base_mint, c.block_time, p.created_time FROM pools p
+                   JOIN curve_complete c ON c.pool = p.pool WHERE p.base_mint LIKE ? LIMIT 1""", (pre + "%",)).fetchall()
+    else:
+        sample = db.execute(
+        f"""SELECT p.pool, p.base_mint, c.block_time, p.created_time FROM pools p JOIN curve_complete c ON c.pool = p.pool
             WHERE p.config IN ({ph}) AND p.tracked = 1 AND p.created_time BETWEEN ? AND ?
             ORDER BY RANDOM() LIMIT ?""",
         cfgs + [now - 5 * 86400, now - 86400, SAMPLE]).fetchall()
 
     total = defaultdict(float)
-    print(f"\n{'token':<9} {'tx':>5} {'span':>7}  {'LP out':>7}  {'farm vol':>8} {'farm net':>8}  "
-          f"{'ext vol':>7} {'ext net':>8} {'ext buys':>8}  {'linked share':>12}")
-    for pool, mint, grad_time in sample:
+    print(f"\n{'token':<9} {'curve tx':>8} {'damm tx':>8} {'span':>8} | {'op curve':>8} {'LP out':>7} {'op damm':>8} "
+          f"{'farm vol':>8} | {'OPERATOR':>8} | {'ext curve':>9} {'ext damm':>8} {'ext buys':>8}")
+    for pool, mint, grad_time, created in sample:
         try:
-            # 1) история минта после завершения кривой — чтобы найти пул DAMM v2;
-            # 2) история самого пула: создание при миграции, выводы ликвидности и свопы
-            sigs = signatures_after(mint, grad_time)[:MAX_TX]
+            # полный цикл: история пула DBC (создание, кривая, миграция) и пула DAMM v2 после неё
+            curve_sigs = signatures_after(pool, (created or grad_time) - 120, MAX_TX)[:MAX_TX]
+            sigs = signatures_after(mint, grad_time)[:200]
             damm = None
             for s0 in sigs:
                 tx0 = rpc("getTransaction", [s0["signature"], {"encoding": "json", "maxSupportedTransactionVersion": 1}])
@@ -201,16 +210,19 @@ def main():
                     damm = find_damm_pool(tx0)
                     if damm:
                         break
-            if damm:
-                sigs = signatures_after(damm, grad_time - 600)[:MAX_TX]
+            damm_sigs = signatures_after(damm, grad_time - 600, MAX_TX)[:MAX_TX] if damm else []
             if VERBOSE:
-                print(f"  {mint[:8]}: DAMM v2 pool {damm or 'not found'}; {len(sigs)} transactions")
+                print(f"  {mint[:8]}: DBC pool {pool}, {len(curve_sigs)} tx; DAMM v2 pool {damm or 'not found'}, {len(damm_sigs)} tx")
         except Exception as e:  # noqa: BLE001
             print(f"{mint[:8]:<9} rpc error: {e}")
             continue
         st = defaultdict(float)
+        seen_sig = set()
         last_t = grad_time
-        for s in sigs:
+        for s in curve_sigs + damm_sigs:
+            if s["signature"] in seen_sig:
+                continue  # пакет миграции есть в обеих историях
+            seen_sig.add(s["signature"])
             try:
                 tx = rpc("getTransaction", [s["signature"], {"encoding": "json", "maxSupportedTransactionVersion": 1}])
             except Exception as e:  # noqa: BLE001
@@ -226,47 +238,49 @@ def main():
             sol, tok = deltas(tx, signer, mint)
             k = kind(sol, tok)
             t = tx.get("blockTime") or 0
-            if VERBOSE:
-                progs = "+".join(n for n, f in (("DBC", in_dbc), ("DAMM", in_damm)) if f) or "-"
-                print(f"    t{t - grad_time:>+7}s  {s['signature'][:10]}  {signer[:8]} {'L' if signer in linked else 'E'}  "
-                      f"{progs:<8}  SOL {sol / 1e9:+9.4f}  token {tok:+d}  {k}")
-            if in_dbc and not in_damm:
-                continue  # сделка на кривой DBC, не после миграции
-            last_t = max(last_t, t)
             v = sol / 1e9
-            if signer in linked:
-                if k == "remove_liq" or (in_dbc and v > 0):
-                    st["lp_out"] += v  # вывод ликвидности (в т.ч. пакетом с миграцией)
-                elif k in ("buy", "sell"):
-                    st["farm_vol"] += abs(v)
-                    st["farm_net"] += v
+            phase = "migr" if (in_dbc and in_damm) else ("damm" if in_damm else "curve")
+            is_l = signer in linked
+            if VERBOSE:
+                print(f"    t{t - grad_time:>+8}s  {s['signature'][:10]}  {signer[:8]} {'L' if is_l else 'E'}  "
+                      f"{phase:<5}  SOL {v:+9.4f}  token {tok:+d}  {k}")
+            if phase != "curve":
+                last_t = max(last_t, t)
+            if is_l:
+                if phase == "curve":
+                    st["op_curve"] += v  # всё, включая создание пула, торговлю фермы и комиссии сети
+                elif phase == "migr" or k == "remove_liq":
+                    st["lp_out"] += v
+                else:
+                    st["op_damm"] += v
+                    if k in ("buy", "sell"):
+                        st["farm_vol"] += abs(v)
             elif k in ("buy", "sell"):
-                st["ext_vol"] += abs(v)
-                st["ext_net"] += v
-                st["ext_buys"] += k == "buy"
-        vol = st["farm_vol"] + st["ext_vol"]
-        share = f"{100 * st['farm_vol'] / vol:.0f}%" if vol else "-"
-        trunc = "+" if len(sigs) >= MAX_TX else ""
-        for k2 in ("lp_out", "farm_vol", "farm_net", "ext_vol", "ext_net", "ext_buys", "errors"):
+                st["ext_" + ("curve" if phase == "curve" else "damm")] += v
+                st["ext_buys"] += k == "buy" and phase != "curve"
+        op = st["op_curve"] + st["lp_out"] + st["op_damm"]
+        for k2 in ("op_curve", "lp_out", "op_damm", "farm_vol", "ext_curve", "ext_damm", "ext_buys", "errors"):
             total[k2] += st[k2]
+        total["op"] += op
         total["pools"] += 1
-        print(f"{mint[:8]:<9} {len(sigs):>4}{trunc:<1} {last_t - grad_time:>6}s  {st['lp_out']:>7.3f}  "
-              f"{st['farm_vol']:>8.2f} {st['farm_net']:>+8.3f}  {st['ext_vol']:>7.3f} {st['ext_net']:>+8.3f} "
-              f"{int(st['ext_buys']):>8}  {share:>12}")
+        tc = f"{len(curve_sigs)}{'+' if len(curve_sigs) >= MAX_TX else ''}"
+        td = f"{len(damm_sigs)}{'+' if len(damm_sigs) >= MAX_TX else ''}"
+        print(f"{mint[:8]:<9} {tc:>8} {td:>8} {last_t - grad_time:>7}s | {st['op_curve']:>+8.3f} {st['lp_out']:>7.3f} "
+              f"{st['op_damm']:>+8.3f} {st['farm_vol']:>8.1f} | {op:>+8.3f} | {st['ext_curve']:>+9.3f} {st['ext_damm']:>+8.3f} "
+              f"{int(st['ext_buys']):>8}")
 
     if total["pools"]:
         n = total["pools"]
-        vol = total["farm_vol"] + total["ext_vol"]
-        print(f"\nTOTAL over {int(n)} pools: LP withdrawn by linked {total['lp_out']:.2f} SOL; "
-              f"farm volume {total['farm_vol']:.1f} SOL (net {total['farm_net']:+.2f}); "
-              f"external volume {total['ext_vol']:.2f} SOL (net {total['ext_net']:+.3f}, {int(total['ext_buys'])} buys); "
-              f"linked share of DAMM v2 volume {100 * total['farm_vol'] / vol if vol else 0:.0f}%"
+        print(f"\nTOTAL over {int(n)} pools: operator net {total['op']:+.3f} SOL ({total['op'] / n:+.3f} per launch) = "
+              f"curve {total['op_curve']:+.2f} + LP out {total['lp_out']:+.2f} + DAMM trading {total['op_damm']:+.2f}; "
+              f"farm volume in DAMM v2 {total['farm_vol']:.1f} SOL; externals net {total['ext_curve'] + total['ext_damm']:+.3f} SOL "
+              f"(curve {total['ext_curve']:+.3f}, DAMM {total['ext_damm']:+.3f}, {int(total['ext_buys'])} DAMM buys)"
               + (f"; {int(total['errors'])} tx errors" if total["errors"] else ""))
-    print("notes: history of the DAMM v2 pool from 10 min before curve completion; DBC-only transactions skipped;"
-          "\n       span = last transaction counted, seconds after completion ('+' after tx = limit reached);"
-          "\n       LP out = SOL received by linked addresses in liquidity removals (incl. the migration bundle);"
-          "\n       farm/ext net = SOL received minus SOL spent in trades (negative = paid into the pool);"
-          "\n       changes under 0.005 SOL are treated as fees or transfers, not trades.")
+    print("notes: full cycle per token: DBC pool history (creation, curve, migration bundle) + DAMM v2 pool history;"
+          "\n       SOL is the signer's balance change incl. network fees; positive = received, negative = paid;"
+          "\n       OPERATOR = all linked signers together (creator, receivers, farm); externals = everyone else;"
+          "\n       '+' after a tx count = limit reached (raise max_tx); span = last DAMM/migration tx after completion;"
+          "\n       farm funding transfers and leftover tokens (unsold supply) are not counted.")
 
 if __name__ == "__main__":
     main()
