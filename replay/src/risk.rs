@@ -251,7 +251,7 @@ impl Verdict {
         match self {
             Verdict::Synthetic => "synthetic launches: trading is dominated by the creator and wallets linked to it",
             Verdict::RedLinked => "shares operator addresses with configs where synthetic launches were observed",
-            Verdict::RugCapable => "config allows pulling liquidity and dumping a large leftover supply after migration",
+            Verdict::RugCapable => "risky config: the creator or launchpad can take most of the buyers' SOL or liquidity at or after migration",
             Verdict::SelfGraduation => "instant / self-funded graduation: no real bonding-curve market; risk moves to the post-migration DAMM v2 pool",
             Verdict::Standard => "no major red flags in config or observed behaviour",
         }

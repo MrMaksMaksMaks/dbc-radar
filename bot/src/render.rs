@@ -283,7 +283,7 @@ pub fn how() -> String {
     s.push_str(&format!(
         "\n🔴 {}\n🟠 {}\n⚪ {}\n🟢 {}",
         esc("RED / RED-LINK — synthetic launches or linked to their operator"),
-        esc("AMBER — config allows pulling liquidity and dumping leftover supply"),
+        esc("AMBER — risky config: the creator or launchpad can take most of the buyers' SOL or liquidity at or after migration"),
         esc("SELF-GRAD — instant graduation, no market on the curve"),
         esc("GREEN — no major red flags; minor signals are listed in the report")
     ));

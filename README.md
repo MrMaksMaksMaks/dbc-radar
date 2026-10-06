@@ -26,7 +26,7 @@ The verdict separates good configs from bad ones; it is not a verdict on DBC. We
 |---|---|
 | 🟢 **GREEN** | no major red flags in the config or in observed trading (minor signals are still listed) |
 | ⚪ **SELF-GRAD** | instant or self-funded graduation, no real market on the curve |
-| 🟠 **AMBER** | the config allows pulling liquidity and dumping leftover supply; no abuse observed yet |
+| 🟠 **AMBER** | risky config: the creator or launchpad can take most of the buyers' SOL or liquidity at or after migration (unlocked liquidity with a large leftover supply, or a migration fee of 50% and more); no abuse observed yet |
 | 🔴 **RED** | synthetic launches: trading is dominated by the creator and wallets linked to it |
 | 🔴 **RED-LINK** | a new config linked by addresses to a synthetic-launch operator — flagged before its first trade |
 
