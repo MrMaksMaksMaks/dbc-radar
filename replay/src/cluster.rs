@@ -20,6 +20,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// Один-два общих адреса могут быть случайностью (общий торговый бот), три и больше — нет.
 pub const MIN_SHARED_SATELLITES: usize = 3;
 
+/// Адреса, которые никогда не связывают конфиги: сжигание и системная программа.
+const NEVER_LINK: [&str; 2] = ["1nc1nerator11111111111111111111111111111111", "11111111111111111111111111111111"];
+
 #[derive(Debug, Clone)]
 pub struct ConfigInfo {
     #[allow(dead_code)]
@@ -141,7 +144,12 @@ impl Dsu {
 }
 
 /// Кластеры конфигов, связанных общими адресами. Возвращаются все, включая одиночные.
-pub fn clusters(infos: &[ConfigInfo]) -> Vec<Cluster> {
+///
+/// `red[i]` — у конфига i синтетика по собственным доказательствам. Адрес платформы
+/// (лаунчпада) — встречается в `platform_min` и более конфигах, а синтетика наблюдается
+/// меньше чем в половине из них; такой адрес не связывает конфиги ни в какой роли:
+/// иначе все запуски платформы склеиваются в один «кластер оператора».
+pub fn clusters(infos: &[ConfigInfo], red: &[bool], platform_min: usize) -> Vec<Cluster> {
     let n = infos.len();
     let mut dsu = Dsu::new(n);
 
@@ -158,6 +166,12 @@ pub fn clusters(infos: &[ConfigInfo]) -> Vec<Cluster> {
             by_addr.entry((LinkKind::Creator, a.clone())).or_default().push(i);
         }
     }
+    let is_platform = |idx: &Vec<usize>| -> bool {
+        let distinct: HashSet<usize> = idx.iter().copied().collect();
+        let reds = distinct.iter().filter(|&&i| red.get(i).copied().unwrap_or(false)).count();
+        distinct.len() >= platform_min && reds * 2 < distinct.len()
+    };
+    by_addr.retain(|(_, addr), idx| !NEVER_LINK.contains(&addr.as_str()) && !is_platform(idx));
     let mut edges: Vec<(usize, usize, LinkKind)> = Vec::new();
     for ((kind, _), idx) in &by_addr {
         for w in idx.windows(2) {
@@ -272,7 +286,7 @@ mod tests {
             // один общий сателлит — недостаточно для связи
             info("w1", "fw1", "lw1", "T_X", &["cw1"], &["s1"]),
         ];
-        let cl = clusters(&infos);
+        let cl = clusters(&infos, &vec![false; infos.len()], 10);
         let find = |name: &str| {
             let i = infos.iter().position(|c| c.config == name).unwrap();
             cl.iter().find(|c| c.members.contains(&i)).unwrap().id
@@ -285,6 +299,34 @@ mod tests {
         let x = cl.iter().find(|c| c.id == find("x1")).unwrap();
         assert!(x.links.contains_key(&LinkKind::LeftoverReceiver));
         assert!(x.links.contains_key(&LinkKind::Satellites));
+    }
+
+    #[test]
+    fn platform_and_burn_addresses_do_not_link() {
+        let mut infos = Vec::new();
+        let mut red = Vec::new();
+        // платформа: 12 конфигов с общим получателем и создателем пулов, синтетика в одном
+        for k in 0..12 {
+            infos.push(info(&format!("p{k}"), "PLATFORM", "PLATFORM", "T", &["PLATFORM_CREATOR"], &[]));
+            red.push(k == 0);
+        }
+        // оператор: 12 конфигов с общим получателем, синтетика в 8 — это адрес оператора
+        for k in 0..12 {
+            infos.push(info(&format!("o{k}"), "OPERATOR", &format!("lo{k}"), "T", &[format!("co{k}").as_str()], &[]));
+            red.push(k < 8);
+        }
+        // честные конфиги, сжигающие остаток: адрес сжигания не связывает
+        infos.push(info("b1", "fb1", "1nc1nerator11111111111111111111111111111111", "T", &["cb1"], &[]));
+        infos.push(info("b2", "fb2", "1nc1nerator11111111111111111111111111111111", "T", &["cb2"], &[]));
+        red.extend([false, false]);
+        let cl = clusters(&infos, &red, 10);
+        let id = |name: &str| {
+            let i = infos.iter().position(|c| c.config == name).unwrap();
+            cl.iter().find(|c| c.members.contains(&i)).unwrap().id
+        };
+        assert_ne!(id("p0"), id("p1"), "platform address must not link configs");
+        assert_eq!(id("o0"), id("o11"), "operator address links its configs");
+        assert_ne!(id("b1"), id("b2"), "burn address must not link configs");
     }
 
     #[test]

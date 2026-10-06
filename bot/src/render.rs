@@ -162,7 +162,11 @@ fn dur(secs: i64) -> String {
 pub fn operator(r: &ConfigRisk, all: &HashMap<String, ConfigRisk>) -> String {
     let cluster = r.u("cluster");
     let size = r.u("cluster_size");
-    let mut s = format!("{}\n\n", bold("Operator"));
+    // кластер без синтетики — просто связанные конфиги, а не «оператор»
+    let any_red = size > 1
+        && all.values().any(|x| x.u("cluster") == cluster && matches!(x.verdict().as_str(), "RED" | "RED-LINK"));
+    let heading = if size <= 1 || any_red { "Operator" } else { "Linked configs" };
+    let mut s = format!("{}\n\n", bold(heading));
     // адреса оператора сокращены (как в API без ключа): бот не выдаёт готовый список операторов
     s.push_str(&format!("Top creator {}\n", code(&short(&r.s("top_creator")))));
     s.push_str(&format!("Fee claimer {}\n", code(&short(&r.s("fee_claimer")))));
@@ -183,7 +187,11 @@ pub fn operator(r: &ConfigRisk, all: &HashMap<String, ConfigRisk>) -> String {
         members.sort_by(|a, b| b.u("pools").cmp(&a.u("pools")));
         s.push_str(&format!(
             "{}\n",
-            esc(&format!("Linked to {} configs by shared creators, fee/leftover receivers or wallets:", members.len()))
+            esc(&format!(
+                "Linked to {} configs by shared creators, fee/leftover receivers or wallets{}:",
+                members.len(),
+                if any_red { "" } else { " (no synthetic launches observed among them)" }
+            ))
         ));
         for m in members.iter().take(10) {
             s.push_str(&format!(

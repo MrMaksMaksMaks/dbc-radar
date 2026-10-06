@@ -442,7 +442,9 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
         });
     }
 
-    let clusters = cluster::clusters(&infos);
+    // вердикты по собственным доказательствам конфигов — чтобы отличить адреса платформ
+    let own_red: Vec<bool> = rows.iter().map(|r| r.rep.verdict == risk::Verdict::Synthetic).collect();
+    let clusters = cluster::clusters(&infos, &own_red, risk::PLATFORM_MIN_CONFIGS);
     for c in &clusters {
         for &m in &c.members {
             rows[m].cluster = c.id;
