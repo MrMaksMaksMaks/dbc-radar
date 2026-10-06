@@ -779,9 +779,10 @@ fn run_risk(conn: &rusqlite::Connection, args: &Args) -> Result<()> {
         }
         if let Some(fs) = &b.farm {
             println!(
-                "  linked activity      {} recurring wallets ({} early first-buyers); linked volume {} of total (median per pool)",
+                "  linked activity      {} recurring wallets ({} early first-buyers, {} specific by volume only); linked volume {} of total (median per pool)",
                 fs.farm_wallets,
                 fs.first_buyers,
+                fs.volume_only_wallets,
                 fs.median_linked_share.map(|x| format!("{:.0}%", x * 100.0)).unwrap_or("-".into())
             );
             println!(

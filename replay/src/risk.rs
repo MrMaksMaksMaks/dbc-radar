@@ -375,6 +375,16 @@ pub fn score(f: &ConfigFacts, b: &Behavior) -> Report {
                 add(&mut ev, 20, format!("{:.0}% of trading volume (median per pool) comes from the creator and linked wallets", sh * 100.0));
             }
         }
+        if fs.volume_only_wallets >= 5 {
+            add(
+                &mut ev,
+                0,
+                format!(
+                    "{} linked wallets also trade small amounts in unrelated pools (possible decoy activity); they are still counted as linked by volume",
+                    fs.volume_only_wallets
+                ),
+            );
+        }
         if fs.farm_wallets >= 5 && fs.median_linked_share.unwrap_or(0.0) < 0.8 {
             add(&mut ev, 10, format!("{} wallets trade in most of this config's pools and almost nowhere else", fs.farm_wallets));
         }

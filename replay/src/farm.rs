@@ -5,7 +5,8 @@
 //!   7.  веерная раздача: кошельки, которые продают токены, ни разу не купив их в пуле;
 //!   8.  повторяющийся набор участников: кошелёк торгует в большой доле пулов конфига
 //!       и почти нигде больше (специфичность), — отличает ферму от общих ботов,
-//!       которые торгуют все новые токены подряд;
+//!       которые торгуют все новые токены подряд. Специфичность считается и по числу пулов,
+//!       и по SOL-объёму: пыль в сторонних пулах не размывает кошелёк фермы;
 //!   9.  доля связанного объёма: объём создателя, фермы и веерных продавцов к общему;
 //!   10. постоянный «первый покупатель»: кошелёк покупает в первые секунды большинства пулов;
 //!   11. фиксированная стартовая покупка: одинаковая сумма первой покупки создателя
@@ -31,13 +32,20 @@ pub const MIN_POOLS: usize = 3;
 /// Пулы с мгновенной graduation (одна покупка создателя) в долю связанного объёма не входят.
 pub const MIN_ACTIVE_SWAPS: usize = 3;
 
-/// Во скольких отслеживаемых пулах всей базы торговал каждый кошелёк.
-pub struct WalletIndex(HashMap<String, u32>);
+/// Для каждого кошелька по всей базе: (в скольких отслеживаемых пулах торговал, его объём
+/// в единицах котируемого токена: покупка — сколько вошло, продажа — сколько вышло).
+pub struct WalletIndex(HashMap<String, (u32, u64)>);
 
 pub fn wallet_index(conn: &Connection) -> Result<WalletIndex> {
-    let mut st = conn.prepare("SELECT fee_payer, COUNT(DISTINCT pool) FROM swaps GROUP BY fee_payer")?;
+    let mut st = conn.prepare(
+        "SELECT fee_payer, COUNT(DISTINCT pool),
+                SUM(CASE WHEN trade_direction = 1 THEN included_fee_input_amount ELSE output_amount END)
+         FROM swaps GROUP BY fee_payer",
+    )?;
     let m = st
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32)))?
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)? as u32, r.get::<_, Option<i64>>(2)?.unwrap_or(0).max(0) as u64)))
+        })?
         .collect::<std::result::Result<HashMap<_, _>, _>>()?;
     Ok(WalletIndex(m))
 }
@@ -48,6 +56,9 @@ pub struct FarmStats {
     pub graduated: usize,
     pub median_migration_secs: Option<f64>,
     pub farm_wallets: usize,
+    /// кошельки фермы, специфичные только по объёму: торгуют мелочью и в сторонних пулах
+    /// (возможная маскировка)
+    pub volume_only_wallets: usize,
     pub first_buyers: usize,
     /// (сумма в SOL, доля пулов с этой суммой) — самая частая стартовая покупка создателя
     pub dev_buy_mode: Option<(f64, f64)>,
@@ -197,6 +208,8 @@ pub fn analyze_scope(
 
     // --- Определение фермы (по всем отслеживаемым пулам конфига) ---
     let mut in_pools: HashMap<&str, u32> = HashMap::new();
+    // SOL-объём кошелька в пулах области (для специфичности по объёму)
+    let mut vol_in: HashMap<&str, u64> = HashMap::new();
     let mut early_in: HashMap<&str, u32> = HashMap::new();
     // то же, но только по пулам оцениваемого конфига (metrics)
     let mut in_metric: HashMap<&str, u32> = HashMap::new();
@@ -224,6 +237,7 @@ pub fn analyze_scope(
                 first.push((w, s.input));
             }
             seen.insert(w);
+            *vol_in.entry(w).or_default() += sol_volume(s);
             if s.buy && s.slot <= p.created_slot + EARLY_SLOTS {
                 early.insert(w);
             }
@@ -251,9 +265,19 @@ pub fn analyze_scope(
         opening.push(first);
     }
 
+    // Специфичность: (по числу пулов, по объёму). Общий бот размазан по множеству пулов и по
+    // пулам, и по объёму; кошелёк фермы, который ради маскировки торгует пылью в сторонних
+    // пулах, теряет специфичность по пулам, но не по объёму.
+    let spec = |w: &str, k: u32| -> (bool, bool) {
+        let (gp, gv) = idx.0.get(w).copied().unwrap_or((k, 0));
+        let by_pools = k as f64 / gp.max(k) as f64 >= SPECIFICITY;
+        let v = vol_in.get(w).copied().unwrap_or(0);
+        let by_volume = v > 0 && v as f64 / gv.max(v) as f64 >= SPECIFICITY;
+        (by_pools, by_volume)
+    };
     let specific = |w: &str, k: u32| -> bool {
-        let global = idx.0.get(w).copied().unwrap_or(k).max(k);
-        k as f64 / global as f64 >= SPECIFICITY
+        let (p, v) = spec(w, k);
+        p || v
     };
     // Повторяемость — по всей области (кластер оператора: ферма разнесена по его конфигам)
     // ИЛИ по пулам самого конфига: в большом кластере ферма одного конфига — малая доля
@@ -276,6 +300,13 @@ pub fn analyze_scope(
         }
     }
     out.farm_wallets = farm.len();
+    out.volume_only_wallets = farm
+        .iter()
+        .filter(|w| {
+            let (p, v) = spec(w, in_pools.get(*w).copied().unwrap_or(0));
+            !p && v
+        })
+        .count();
 
     // фиксированная стартовая покупка создателя
     out.dev_buy_mode = amount_mode(&dev_buys);
@@ -405,6 +436,39 @@ mod tests {
     /// Ферма оператора разнесена по двум конфигам: по одному конфигу кошельки неспецифичны
     /// (половина их активности в другом конфиге), по кластеру — специфичны.
     /// Пулы мгновенной graduation (только покупка создателя) в долю связанного объёма не входят.
+    #[test]
+    fn decoy_dust_does_not_hide_a_farm_wallet() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pools(pool, config, creator, created_time, created_slot, tracked);
+             CREATE TABLE swaps(pool, fee_payer, trade_direction, included_fee_input_amount, output_amount, slot, event_index);
+             CREATE TABLE curve_complete(pool, block_time);",
+        )
+        .unwrap();
+        let sw = |pool: &str, w: &str, i: i64| {
+            conn.execute("INSERT INTO swaps VALUES(?1,?2,1,?3,1,140,0)", params![pool, w, i]).unwrap();
+        };
+        // конфиг A: 4 пула; FARM покупает по 1 SOL, общий BOT — по 0,01 SOL
+        for k in 0..4 {
+            let p = format!("A{k}");
+            conn.execute("INSERT INTO pools VALUES(?1,'A','HUB',1000,100,1)", params![p]).unwrap();
+            sw(&p, "FARM", 1_000_000_000);
+            sw(&p, "BOT", 10_000_000);
+        }
+        // 10 сторонних пулов: FARM торгует пылью для маскировки, BOT — обычными суммами
+        for k in 0..10 {
+            let p = format!("Z{k}");
+            conn.execute("INSERT INTO pools VALUES(?1,'Z','OTHER',1000,100,1)", params![p]).unwrap();
+            sw(&p, "FARM", 100_000);
+            sw(&p, "BOT", 10_000_000);
+        }
+        let idx = wallet_index(&conn).unwrap();
+        let f = analyze_config(&conn, "A", &idx, 0).unwrap();
+        // FARM: по пулам 4/14 — не специфичен, по объёму 4 SOL из 4,001 — специфичен
+        assert_eq!(f.farm_wallets, 1, "FARM — ферма, BOT — общий бот");
+        assert_eq!(f.volume_only_wallets, 1);
+    }
+
     #[test]
     fn farm_of_one_config_inside_a_large_cluster() {
         let conn = Connection::open_in_memory().unwrap();
