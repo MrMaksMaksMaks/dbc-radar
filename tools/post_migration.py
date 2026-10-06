@@ -3,7 +3,8 @@
 
 Запуск из корня репозитория (нужны dbc.sqlite, .env и свежий risk --json):
     replay/target/release/dbc-replay dbc.sqlite risk --json > /tmp/risk_new.json
-    python3 post_migration.py [cluster_id] [pools] [max_tx_per_pool]
+    python3 post_migration.py [cluster_id] [pools] [max_tx_per_pool] [-v]
+    (-v: печатать каждую транзакцию после завершения кривой)
 
 Для выборки выпустившихся пулов кластера:
   * загружается история транзакций токена (минта) после времени graduation — так видна вся
@@ -23,9 +24,11 @@ import time
 import urllib.request
 from collections import defaultdict
 
-CLUSTER = sys.argv[1] if len(sys.argv) > 1 else "5"
-SAMPLE = int(sys.argv[2]) if len(sys.argv) > 2 else 15
-MAX_TX = int(sys.argv[3]) if len(sys.argv) > 3 else 150
+VERBOSE = "-v" in sys.argv
+ARGS = [a for a in sys.argv[1:] if a != "-v"]
+CLUSTER = ARGS[0] if len(ARGS) > 0 else "5"
+SAMPLE = int(ARGS[1]) if len(ARGS) > 1 else 15
+MAX_TX = int(ARGS[2]) if len(ARGS) > 2 else 150
 RPS = 4.0
 MIN_SOL = 5_000_000  # 0,005 SOL: меньшие изменения — комиссии сети и рента, а не сделка
 DAMM_V2 = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG"
@@ -185,12 +188,17 @@ def main():
                 continue
             signer = tx["transaction"]["message"]["accountKeys"][0]
             in_damm = uses(tx, DAMM_V2)
-            if uses(tx, DBC) and not in_damm:
-                continue  # сделка на кривой DBC в секунду завершения, не после миграции
-            damm_tx += in_damm
+            in_dbc = uses(tx, DBC)
             sol, tok = deltas(tx, signer, mint)
             k = kind(sol, tok)
             t = tx.get("blockTime") or 0
+            if VERBOSE:
+                progs = "+".join(n for n, f in (("DBC", in_dbc), ("DAMM", in_damm)) if f) or "-"
+                print(f"    t+{t - grad_time:>6}s  {s['signature'][:10]}  {signer[:8]} {'L' if signer in linked else 'E'}  "
+                      f"{progs:<8}  SOL {sol / 1e9:+9.4f}  token {tok:+d}  {k}")
+            if in_dbc and not in_damm:
+                continue  # сделка на кривой DBC в секунду завершения, не после миграции
+            damm_tx += in_damm
             if signer in linked:
                 if sol > 0:
                     st["linked_out"] += sol / 1e9
