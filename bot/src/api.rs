@@ -7,7 +7,11 @@
 //!
 //! Адреса из базы отдаются всем. Поиск неизвестных адресов через RPC расходует лимиты
 //! провайдеров, поэтому доступен только с ключом (заголовок `X-API-Key`).
-//! Лимит запросов — на IP в минуту (за Cloudflare берётся заголовок CF-Connecting-IP).
+//! Без ключа из ответа /v1/check убираются адреса создателя и получателей
+//! (launch.creator, config.top_creator, config.fee_claimer, config.leftover_receiver).
+//! Неверный ключ — ответ 401.
+//! Лимит запросов — на IP в минуту. За Cloudflare берётся заголовок CF-Connecting-IP,
+//! но только если соединение пришло с loopback (от локального cloudflared).
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -61,33 +65,59 @@ fn err(status: StatusCode, code: &str, message: &str) -> Response {
     (status, Json(json!({"error": code, "message": message}))).into_response()
 }
 
-/// Проверка лимита. Возвращает Some(ответ 429), если лимит превышен; иначе — есть ли ключ.
+/// Проверка лимита и ключа. Ok(true) — валидный ключ, Ok(false) — без ключа;
+/// Err — ответ 429 (лимит превышен) или 401 (неверный ключ).
 async fn admit(api: &Api, headers: &HeaderMap, peer: SocketAddr) -> Result<bool, Response> {
-    let key_ok = headers
-        .get("x-api-key")
-        .and_then(|v| v.to_str().ok())
-        .map(|k| api.keys.contains(k))
-        .unwrap_or(false);
-    let client = headers
-        .get("cf-connecting-ip")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-        .unwrap_or_else(|| peer.ip().to_string());
+    let key = headers.get("x-api-key").and_then(|v| v.to_str().ok());
+    let key_ok = key.map(|k| api.keys.contains(k)).unwrap_or(false);
+    // CF-Connecting-IP доверяем только от локального cloudflared, иначе заголовок можно подделать
+    let client = if peer.ip().is_loopback() {
+        headers
+            .get("cf-connecting-ip")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+            .unwrap_or_else(|| peer.ip().to_string())
+    } else {
+        peer.ip().to_string()
+    };
     let limit = if key_ok { api.app.cfg.api_rate_key } else { api.app.cfg.api_rate_public };
     let minute = now() / 60;
-    let mut map = api.limiter.lock().await;
-    if map.len() > 50_000 {
-        map.retain(|_, (m, _)| *m == minute);
+    {
+        let mut map = api.limiter.lock().await;
+        if map.len() > 50_000 {
+            map.retain(|_, (m, _)| *m == minute);
+        }
+        let e = map.entry(client).or_insert((minute, 0));
+        if e.0 != minute {
+            *e = (minute, 0);
+        }
+        e.1 += 1;
+        if e.1 > limit {
+            return Err(err(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                &format!("limit is {limit} requests per minute"),
+            ));
+        }
     }
-    let e = map.entry(client).or_insert((minute, 0));
-    if e.0 != minute {
-        *e = (minute, 0);
-    }
-    e.1 += 1;
-    if e.1 > limit {
-        return Err(err(StatusCode::TOO_MANY_REQUESTS, "rate_limited", &format!("limit is {limit} requests per minute")));
+    // неверный ключ проверяется после лимита, чтобы перебор ключей тоже ограничивался
+    if key.is_some() && !key_ok {
+        return Err(err(StatusCode::UNAUTHORIZED, "invalid_api_key", "X-API-Key is not valid"));
     }
     Ok(key_ok)
+}
+
+/// Без ключа скрываем адреса создателя и получателей:
+/// публичны вердикт, флаги и проценты, адреса операторов — только по ключу.
+fn redact(v: &mut Value) {
+    if let Some(c) = v.get_mut("config").and_then(Value::as_object_mut) {
+        for k in ["top_creator", "fee_claimer", "leftover_receiver"] {
+            c.remove(k);
+        }
+    }
+    if let Some(l) = v.get_mut("launch").and_then(Value::as_object_mut) {
+        l.remove("creator");
+    }
 }
 
 async fn health(AxState(api): AxState<Api>) -> Response {
@@ -133,7 +163,12 @@ async fn from_db(app: &State, addr: &str) -> Option<Value> {
     let conn = app.db().ok()?;
     if let Ok(Some(p)) = store::find_pool(&conn, addr) {
         let config = config_json(app, &p.config).await;
-        return Some(json!({"kind": "launch", "verdict": config.as_ref().and_then(|c| c.get("verdict")).cloned(), "launch": pool_json(&p), "config": config}));
+        return Some(json!({
+            "kind": "launch",
+            "verdict": config.as_ref().and_then(|c| c.get("verdict")).cloned(),
+            "launch": pool_json(&p),
+            "config": config,
+        }));
     }
     if matches!(store::config_exists(&conn, addr), Ok(true)) {
         let config = config_json(app, addr).await?;
@@ -180,7 +215,10 @@ async fn check(
     let Some(addr) = store::extract_address(&address) else {
         return err(StatusCode::BAD_REQUEST, "bad_address", "expected a Solana address");
     };
-    if let Some(v) = from_db(&api.app, &addr).await {
+    if let Some(mut v) = from_db(&api.app, &addr).await {
+        if !key_ok {
+            redact(&mut v);
+        }
         return Json(v).into_response();
     }
     if !key_ok {
@@ -190,6 +228,7 @@ async fn check(
             "address is not in the index; on-chain lookup requires an API key (X-API-Key)",
         );
     }
+    // дальше только запросы с валидным ключом: адреса не скрываются
     let v = match api.app.rpc.resolve(&addr).await {
         Ok(Lookup::Found(f)) => found_json(&api.app, &f).await,
         Ok(Lookup::MeteoraPool { venue, mint }) => {
@@ -201,7 +240,11 @@ async fn check(
             json!({"kind": "token", "dbc": false, "launchpad": lp, "inferred_from_address": by_suffix})
         }
         Ok(Lookup::MintWithoutHistory) => {
-            json!({"kind": "token", "dbc": null, "error": "launch_not_found", "message": "launch not found in available history; try the pool address"})
+            return err(
+                StatusCode::NOT_FOUND,
+                "launch_not_found",
+                "launch not found in available history; try the pool address",
+            )
         }
         Ok(Lookup::NotDbc) => return err(StatusCode::NOT_FOUND, "not_dbc", "not a Meteora DBC pool, token or config"),
         Err(e) => return err(StatusCode::BAD_GATEWAY, "rpc_error", &e.to_string()),
