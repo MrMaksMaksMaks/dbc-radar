@@ -97,7 +97,6 @@ fn median(mut v: Vec<f64>) -> Option<f64> {
     Some(if n % 2 == 1 { v[n / 2] } else { (v[n / 2 - 1] + v[n / 2]) / 2.0 })
 }
 
-/// SOL-объём сделки: покупка — сколько SOL вошло, продажа — сколько вышло.
 /// Округление суммы до трёх значащих цифр: «одинаковая сумма» и для 8,06 SOL, и для 0,00123 SOL.
 fn sig3(l: u64) -> u64 {
     if l < 1000 {
@@ -132,6 +131,7 @@ pub fn fmt_sol(sol: f64) -> String {
     }
 }
 
+/// SOL-объём сделки: покупка — сколько SOL вошло, продажа — сколько вышло.
 fn sol_volume(s: &Swap) -> u64 {
     if s.buy { s.input } else { s.output }
 }
@@ -198,6 +198,9 @@ pub fn analyze_scope(
     // --- Определение фермы (по всем отслеживаемым пулам конфига) ---
     let mut in_pools: HashMap<&str, u32> = HashMap::new();
     let mut early_in: HashMap<&str, u32> = HashMap::new();
+    // то же, но только по пулам оцениваемого конфига (metrics)
+    let mut in_metric: HashMap<&str, u32> = HashMap::new();
+    let mut early_metric: HashMap<&str, u32> = HashMap::new();
     let mut fanout_per_pool: Vec<HashSet<&str>> = Vec::with_capacity(n);
     let mut dev_buys: Vec<u64> = Vec::new();
     // первые покупки не от создателя (до 5 на пул): кошелёк и сумма, по порядку
@@ -228,11 +231,18 @@ pub fn analyze_scope(
                 fanout.insert(w);
             }
         }
+        let is_metric = metric_set.contains(p.config.as_str());
         for w in seen {
             *in_pools.entry(w).or_default() += 1;
+            if is_metric {
+                *in_metric.entry(w).or_default() += 1;
+            }
         }
         for w in early {
             *early_in.entry(w).or_default() += 1;
+            if is_metric {
+                *early_metric.entry(w).or_default() += 1;
+            }
         }
         if dev > 0 && metric_set.contains(p.config.as_str()) {
             dev_buys.push(dev);
@@ -245,20 +255,24 @@ pub fn analyze_scope(
         let global = idx.0.get(w).copied().unwrap_or(k).max(k);
         k as f64 / global as f64 >= SPECIFICITY
     };
+    // Повторяемость — по всей области (кластер оператора: ферма разнесена по его конфигам)
+    // ИЛИ по пулам самого конфига: в большом кластере ферма одного конфига — малая доля
+    // всех пулов кластера, но почти все пулы своего конфига. Специфичность — по области.
+    let n_metric = pools.iter().filter(|p| metric_set.contains(p.config.as_str())).count();
+    let recurs = |k_scope: u32, k_metric: u32, share: f64| -> bool {
+        let need = |total: usize| ((share * total as f64).ceil() as u32).max(MIN_POOLS as u32);
+        (n >= MIN_POOLS && k_scope >= need(n)) || (n_metric >= MIN_POOLS && k_metric >= need(n_metric))
+    };
     let mut farm: HashSet<&str> = HashSet::new();
-    if n >= MIN_POOLS {
-        let need = ((RECUR_SHARE * n as f64).ceil() as u32).max(MIN_POOLS as u32);
-        for (w, k) in &in_pools {
-            if *k >= need && specific(w, *k) {
-                farm.insert(w);
-            }
+    for (w, k) in &in_pools {
+        if recurs(*k, in_metric.get(w).copied().unwrap_or(0), RECUR_SHARE) && specific(w, *k) {
+            farm.insert(w);
         }
-        let need_first = ((FIRST_BUYER_SHARE * n as f64).ceil() as u32).max(MIN_POOLS as u32);
-        for (w, k) in &early_in {
-            if *k >= need_first && specific(w, in_pools[w]) {
-                out.first_buyers += 1;
-                farm.insert(w);
-            }
+    }
+    for (w, k) in &early_in {
+        if recurs(*k, early_metric.get(w).copied().unwrap_or(0), FIRST_BUYER_SHARE) && specific(w, in_pools[w]) {
+            out.first_buyers += 1;
+            farm.insert(w);
         }
     }
     out.farm_wallets = farm.len();
@@ -391,6 +405,43 @@ mod tests {
     /// Ферма оператора разнесена по двум конфигам: по одному конфигу кошельки неспецифичны
     /// (половина их активности в другом конфиге), по кластеру — специфичны.
     /// Пулы мгновенной graduation (только покупка создателя) в долю связанного объёма не входят.
+    #[test]
+    fn farm_of_one_config_inside_a_large_cluster() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pools(pool, config, creator, created_time, created_slot, tracked);
+             CREATE TABLE swaps(pool, fee_payer, trade_direction, included_fee_input_amount, output_amount, slot, event_index);
+             CREATE TABLE curve_complete(pool, block_time);",
+        )
+        .unwrap();
+        let sw = |pool: &str, w: &str, i: i64, slot: i64| {
+            conn.execute("INSERT INTO swaps VALUES(?1,?2,1,?3,1,?4,0)", params![pool, w, i, slot]).unwrap();
+        };
+        // конфиг A: 3 пула, FIRST покупает первым на 8,2125 SOL, F2 торгует в каждом
+        for k in 0..3 {
+            let p = format!("A{k}");
+            conn.execute("INSERT INTO pools VALUES(?1,'A','HUB',1000,100,1)", params![p]).unwrap();
+            sw(&p, "FIRST", 8_212_500_000, 101);
+            sw(&p, "F2", 1_000_000_000, 140);
+        }
+        // конфиг B того же кластера: 10 пулов с разовыми внешними покупателями
+        for k in 0..10 {
+            let p = format!("B{k}");
+            conn.execute("INSERT INTO pools VALUES(?1,'B','HUB',1000,100,1)", params![p]).unwrap();
+            sw(&p, &format!("EXT{k}"), 100_000_000, 140);
+        }
+        let idx = wallet_index(&conn).unwrap();
+        let scope = vec!["A".to_string(), "B".to_string()];
+        // в кластере 13 пулов: по доле кластера (30% = 4 пула) FIRST и F2 не проходят, по доле A — проходят
+        let f = analyze_scope(&conn, &scope, &["A".to_string()], &idx, 0).unwrap();
+        assert_eq!(f.farm_wallets, 2);
+        assert_eq!(f.first_buyers, 1);
+        assert_eq!(f.first_buy_mode, Some((8.21, 1.0)));
+        // для конфига B ферма не появляется
+        let b = analyze_scope(&conn, &scope, &["B".to_string()], &idx, 0).unwrap();
+        assert_eq!(b.farm_wallets, 0);
+    }
+
     #[test]
     fn cluster_scope_and_inactive_pools() {
         let conn = Connection::open_in_memory().unwrap();
