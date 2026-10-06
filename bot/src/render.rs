@@ -104,7 +104,8 @@ pub fn pool_card(p: &PoolInfo, r: Option<&ConfigRisk>) -> String {
     let mut s = format!("{} {}\n\n", emoji(&v), bold(&format!("{v} — {t}")));
     s.push_str(&format!("Token {}\n", code(&p.base_mint)));
     s.push_str(&format!("Pool {}\n", code(&p.pool)));
-    s.push_str(&format!("Creator {}\n", code(&p.creator)));
+    // адрес создателя сокращён: полностью он виден в пуле на Solscan, но бот не выдаёт готовый список операторов
+    s.push_str(&format!("Creator {}\n", code(&short(&p.creator))));
     let instant = r.map(|r| r.0.get("instant_graduation").and_then(|v| v.as_bool()).unwrap_or(false)).unwrap_or(false);
     let age = p.created_time.map(|t| now() - t).unwrap_or(0);
     // данные пула ещё не собраны: отслеживается, но есть только покупка создателя
@@ -114,7 +115,8 @@ pub fn pool_card(p: &PoolInfo, r: Option<&ConfigRisk>) -> String {
         None if instant => "graduates instantly (migration threshold ≈ 0)".into(),
         None if !p.tracked => "graduation status not sampled".into(),
         None if collecting => "trades are still being collected".into(),
-        None => "on the bonding curve".into(),
+        // нет записи о graduation — это не значит, что токен ещё на кривой
+        None => "graduation not recorded".into(),
     };
     s.push_str(&format!("{}\n\n", esc(&format!("Created {} · {}", ago(p.created_time), grad))));
 
@@ -161,12 +163,13 @@ pub fn operator(r: &ConfigRisk, all: &HashMap<String, ConfigRisk>) -> String {
     let cluster = r.u("cluster");
     let size = r.u("cluster_size");
     let mut s = format!("{}\n\n", bold("Operator"));
-    s.push_str(&format!("Top creator {}\n", code(&r.s("top_creator"))));
-    s.push_str(&format!("Fee claimer {}\n", code(&r.s("fee_claimer"))));
+    // адреса оператора сокращены (как в API без ключа): бот не выдаёт готовый список операторов
+    s.push_str(&format!("Top creator {}\n", code(&short(&r.s("top_creator")))));
+    s.push_str(&format!("Fee claimer {}\n", code(&short(&r.s("fee_claimer")))));
     s.push_str(&format!(
         "Leftover receiver {} {}\n\n",
-        code(&r.s("leftover_receiver")),
-        esc(&format!("(in {} configs)", r.u("leftover_receiver_configs")))
+        code(&short(&r.s("leftover_receiver"))),
+        esc(&format!("(in {})", plural(r.u("leftover_receiver_configs"), "config", "configs")))
     ));
     if size <= 1 {
         s.push_str(&esc(&format!(
@@ -208,7 +211,7 @@ pub fn recent(config: &str, rows: &[(String, String, Option<i64>, bool)]) -> Str
         s.push_str(&format!(
             "• {} {}\n",
             link(&short(mint), &format!("https://solscan.io/token/{mint}")),
-            esc(&format!("{} · {} · pool {}", ago(*t), if *grad { "graduated" } else { "on curve" }, short(pool)))
+            esc(&format!("{} · {} · pool {}", ago(*t), if *grad { "graduated" } else { "no graduation seen" }, short(pool)))
         ));
     }
     s
