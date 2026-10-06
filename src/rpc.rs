@@ -117,6 +117,30 @@ impl Rpc {
         Ok(if res.is_null() { None } else { Some(res) })
     }
 
+    /// Аккаунты пачкой (до 100 адресов): для каждого (владелец, данные) или None, если аккаунта нет.
+    pub async fn get_multiple_accounts(&self, keys: &[String]) -> Result<Vec<Option<(String, Vec<u8>)>>> {
+        let res = self
+            .call(
+                "getMultipleAccounts",
+                json!([keys, {"encoding": "base64", "commitment": "confirmed"}]),
+            )
+            .await?;
+        let arr = res.get("value").and_then(Value::as_array).cloned().unwrap_or_default();
+        if arr.len() != keys.len() {
+            bail!("getMultipleAccounts: {} accounts for {} keys", arr.len(), keys.len());
+        }
+        arr.into_iter()
+            .map(|v| {
+                if v.is_null() {
+                    return Ok(None);
+                }
+                let owner = v.get("owner").and_then(Value::as_str).unwrap_or("").to_string();
+                let data = v.pointer("/data/0").and_then(Value::as_str).unwrap_or("");
+                Ok(Some((owner, base64::engine::general_purpose::STANDARD.decode(data)?)))
+            })
+            .collect()
+    }
+
     /// Сырые данные аккаунта (base64 -> bytes).
     pub async fn get_account_data(&self, pubkey: &str) -> Result<Option<Vec<u8>>> {
         let res = self

@@ -289,6 +289,11 @@ pub async fn run(rpc: &Rpc, db_path: &str, prefix: &str, csv: Option<&str>) -> R
         params![p.pool],
         |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, i64>(2)?)),
     ) {
+        Ok((sig, t, q)) if sig == "account" => println!(
+            "- {}: curve complete with {:.4} SOL in the pool (from the pool account; the completing transaction was not collected)\n",
+            rel(t, t0),
+            q as f64 / 1e9
+        ),
         Ok((sig, t, q)) => println!("- {} {}: curve complete with {:.4} SOL in the pool\n", tx_link(&sig), rel(t, t0), q as f64 / 1e9),
         Err(_) => println!("- not recorded (pool not graduated while tracked)\n"),
     }

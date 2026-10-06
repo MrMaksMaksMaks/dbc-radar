@@ -178,6 +178,38 @@ impl Db {
         Ok(())
     }
 
+    /// Graduation по состоянию аккаунта пула (подпись "account", слот 0).
+    /// Пул не закрывается: poller продолжает догружать его свопы. true — запись добавлена.
+    pub fn insert_curve_from_account(
+        &self,
+        pool: &str,
+        config: &str,
+        finish_time: i64,
+        base_reserve: u64,
+        quote_reserve: u64,
+    ) -> Result<bool> {
+        let n = self.conn.lock().unwrap().execute(
+            "INSERT OR IGNORE INTO curve_complete VALUES (?1, ?2, 'account', 0, ?3, ?4, ?5)",
+            params![pool, config, finish_time, i(base_reserve), i(quote_reserve)],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Пулы (отслеживаемые и нет) без записи о graduation, созданные не раньше `since`: (pool, config).
+    pub fn pools_without_graduation(&self, since: i64) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut st = conn.prepare(
+            "SELECT p.pool, p.config FROM pools p
+             WHERE COALESCE(p.created_time, p.discovered_at) >= ?1
+               AND NOT EXISTS (SELECT 1 FROM curve_complete c WHERE c.pool = p.pool)
+             ORDER BY p.created_slot DESC",
+        )?;
+        let rows = st
+            .query_map(params![since], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn record_discovery(&self, sig: &str, source: &str) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "INSERT OR IGNORE INTO discovery VALUES (?1, ?2, ?3)",

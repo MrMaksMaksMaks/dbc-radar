@@ -3,7 +3,8 @@
 //! Задачи:
 //!   - discovery::run_ws     — websocket logsSubscribe, ловит создание пулов;
 //!   - discovery::run_worker — забирает транзакции создания и пишет пулы;
-//!   - poller::run           — собирает свопы отслеживаемых пулов.
+//!   - poller::run           — собирает свопы отслеживаемых пулов;
+//!   - status::run           — отмечает graduation по аккаунтам пулов (все пулы, не только отслеживаемые).
 
 mod app;
 mod db;
@@ -11,6 +12,7 @@ mod discovery;
 mod events;
 mod poller;
 mod rpc;
+mod status;
 mod trace;
 mod tx;
 
@@ -54,6 +56,9 @@ async fn main() -> Result<()> {
     let track_hours: i64 = env_or("TRACK_HOURS", "24").parse().context("TRACK_HOURS")?;
     let poll_interval_secs: u64 =
         env_or("POLL_INTERVAL_SECS", "20").parse().context("POLL_INTERVAL_SECS")?;
+    // проверка graduation по аккаунтам: как часто и за сколько часов назад
+    let grad_check_secs: u64 = env_or("GRAD_CHECK_SECS", "120").parse().context("GRAD_CHECK_SECS")?;
+    let grad_check_hours: i64 = env_or("GRAD_CHECK_HOURS", "24").parse().context("GRAD_CHECK_HOURS")?;
     let config_allowlist: HashSet<String> = env_or("CONFIG_ALLOWLIST", "")
         .split(',')
         .map(str::trim)
@@ -91,6 +96,17 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Разовый проход: `dbc-collector grad-sweep <hours>` — отметить graduation по аккаунтам
+    // пулов, созданных за последние <hours> часов (например, для старых данных).
+    if args.get(1).map(String::as_str) == Some("grad-sweep") {
+        let hours: i64 = args.get(2).context("usage: dbc-collector grad-sweep <hours>")?.parse().context("hours")?;
+        let rpc = rpc::Rpc::new(rpc_url, rps);
+        let db = db::Db::open(&db_path)?;
+        let (checked, found) = status::sweep(&rpc, &db, hours * 3600).await?;
+        println!("checked {checked} pools without graduation, found {found} graduated");
+        return Ok(());
+    }
+
     let app = Arc::new(app::App {
         rpc: rpc::Rpc::new(rpc_url, rps),
         db: db::Db::open(&db_path)?,
@@ -111,6 +127,7 @@ async fn main() -> Result<()> {
     drop(tx);
     tokio::spawn(discovery::run_worker(app.clone(), rx));
     tokio::spawn(poller::run(app.clone()));
+    tokio::spawn(status::run(app.clone(), grad_check_secs, grad_check_hours * 3600));
 
     tokio::signal::ctrl_c().await?;
     tracing::info!("shutting down");
