@@ -237,8 +237,9 @@ def main():
         cfgs + [now - 5 * 86400, now - 86400, SAMPLE]).fetchall()
 
     total = defaultdict(float)
+    funders = defaultdict(set)  # спонсор -> токены выборки, где он пополнял покупателей
     print(f"\n{'token':<9} {'curve tx':>8} {'damm tx':>8} {'span':>8} | {'op curve':>8} {'LP out':>7} {'op damm':>8} "
-          f"{'farm vol':>8} | {'OPERATOR':>8} | {'ext curve':>9} {'ext damm':>8} {'ext buys':>8} | {'left':>7}")
+          f"{'farm vol':>8} | {'OPERATOR':>8} | {'ext curve':>9} {'ext damm':>8} {'ext buys':>8} | {'left':>7} | {'sponsored':>9} {'buyers':>6}")
     for pool, mint, grad_time, created in sample:
         graduated = grad_time is not None
         if not graduated:
@@ -284,13 +285,21 @@ def main():
             if phase != "curve":
                 last_t = max(last_t, t)
             sol_by, tok_by = owner_deltas(tx, mint)
+            # спонсоры в транзакции: не связанные владельцы без изменения токена, отдавшие SOL,
+            # когда в той же транзакции кто-то из не связанных купил токен
+            ext_buyers = [o for o, tk in tok_by.items() if tk > 0 and o not in linked and o not in POOL_AUTHORITIES]
+            if ext_buyers:
+                for o, lam in sol_by.items():
+                    if lam <= -10_000_000 and not tok_by.get(o) and o not in linked and o not in POOL_AUTHORITIES \
+                            and o not in (DBC, DAMM_V2):
+                        st["sponsored_sol"] += -lam / 1e9
+                        st["sponsored_buyers"] += len(ext_buyers)
+                        funders[o].add(mint)
             for owner in set(sol_by) | set(tok_by):
                 if owner in POOL_AUTHORITIES or owner in (DBC, DAMM_V2):
                     continue
                 sol, tok = sol_by.get(owner, 0), tok_by.get(owner, 0)
                 is_l = owner in linked
-                if not is_l and tok == 0:
-                    continue  # не участник сделки: рента новых аккаунтов, плата релейеру и т. п.
                 k = kind(sol, tok)
                 v = sol / 1e9
                 if VERBOSE and (abs(sol) >= 1_000_000 or tok):
@@ -309,7 +318,8 @@ def main():
                     st["ext_" + ("curve" if phase == "curve" else "damm")] += v
                     st["ext_buys"] += tok > 0 and sol < 0 and phase != "curve"
         op = st["op_curve"] + st["lp_out"] + st["op_damm"]
-        for k2 in ("op_curve", "lp_out", "op_damm", "farm_vol", "ext_curve", "ext_damm", "ext_buys", "errors"):
+        for k2 in ("op_curve", "lp_out", "op_damm", "farm_vol", "ext_curve", "ext_damm", "ext_buys", "errors",
+                   "sponsored_sol", "sponsored_buyers"):
             total[k2] += st[k2]
         total["op"] += op
         total["pools"] += 1
@@ -318,7 +328,8 @@ def main():
         span = f"{last_t - grad_time:>7}s" if graduated else "  no grad"
         print(f"{mint[:8]:<9} {tc:>8} {td:>8} {span} | {st['op_curve']:>+8.3f} {st['lp_out']:>7.3f} "
               f"{st['op_damm']:>+8.3f} {st['farm_vol']:>8.1f} | {op:>+8.3f} | {st['ext_curve']:>+9.3f} {st['ext_damm']:>+8.3f} "
-              f"{int(st['ext_buys']):>8} | {-(op + st['ext_curve'] + st['ext_damm']):>+7.3f}")
+              f"{int(st['ext_buys']):>8} | {-(op + st['ext_curve'] + st['ext_damm']):>+7.3f} | "
+              f"{st['sponsored_sol']:>9.3f} {int(st['sponsored_buyers']):>6}")
 
     if total["pools"]:
         n = total["pools"]
@@ -327,12 +338,18 @@ def main():
               f"farm volume in DAMM v2 {total['farm_vol']:.1f} SOL; externals net {total['ext_curve'] + total['ext_damm']:+.3f} SOL "
               f"(curve {total['ext_curve']:+.3f}, DAMM {total['ext_damm']:+.3f}, {int(total['ext_buys'])} DAMM buys)"
               + (f"; {int(total['errors'])} tx errors" if total["errors"] else ""))
+        multi = sorted(((len(t), f) for f, t in funders.items() if len(t) >= 2), reverse=True)
+        print(f"sponsors: {total['sponsored_sol']:.2f} SOL passed to {int(total['sponsored_buyers'])} buyers within the same "
+              f"transaction; {len(funders)} sponsor addresses, {len(multi)} of them in 2+ sampled tokens"
+              + (": " + ", ".join(f"{f[:8]}…×{n}" for n, f in multi[:5]) if multi else ""))
     print("notes: full cycle per token: DBC pool history (creation, curve, migration bundle) + DAMM v2 pool history;"
           "\n       SOL is the signer's balance change incl. network fees; positive = received, negative = paid;"
           "\n       OPERATOR = all linked signers together (creator, receivers, farm); externals = everyone else;"
           "\n       '+' after a tx count = limit reached (raise max_tx); span = last DAMM/migration tx after completion;"
           "\n       balances are counted per owner over all accounts of a transaction (also when a relayer pays the fee;"
-          "\n       '*' in -v marks such owners); pool vaults are excluded; externals = owners whose token balance changed;"
+          "\n       '*' in -v marks such owners); pool vaults are excluded; externals = all other owners;"
+          "\n       sponsored = SOL given by non-linked owners without token change in the same transaction where"
+          "\n       a non-linked owner bought the token (fresh wallets funded at the moment of the buy);"
           "\n       left = -(OPERATOR + externals): SOL left in the pool, fees and rent; should be small and >= 0;"
           "\n       farm funding transfers and leftover tokens (unsold supply) are not counted.")
 
