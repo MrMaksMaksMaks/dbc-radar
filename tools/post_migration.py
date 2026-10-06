@@ -272,9 +272,11 @@ def main():
                     st["op_damm"] += v
                     if k in ("buy", "sell"):
                         st["farm_vol"] += abs(v)
-            elif k in ("buy", "sell"):
+            elif tok != 0:
+                # у внешних — любая сделка с токеном, даже мельче 0,005 SOL: мелкие покупки ботов
+                # в сумме бывают заметны, а у оператора считаются все изменения баланса
                 st["ext_" + ("curve" if phase == "curve" else "damm")] += v
-                st["ext_buys"] += k == "buy" and phase != "curve"
+                st["ext_buys"] += tok > 0 and sol < 0 and phase != "curve"
         op = st["op_curve"] + st["lp_out"] + st["op_damm"]
         for k2 in ("op_curve", "lp_out", "op_damm", "farm_vol", "ext_curve", "ext_damm", "ext_buys", "errors"):
             total[k2] += st[k2]
@@ -298,6 +300,7 @@ def main():
           "\n       SOL is the signer's balance change incl. network fees; positive = received, negative = paid;"
           "\n       OPERATOR = all linked signers together (creator, receivers, farm); externals = everyone else;"
           "\n       '+' after a tx count = limit reached (raise max_tx); span = last DAMM/migration tx after completion;"
+          "\n       externals: every transaction that changes their token balance, of any size;"
           "\n       farm funding transfers and leftover tokens (unsold supply) are not counted.")
 
 if __name__ == "__main__":
