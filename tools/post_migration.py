@@ -3,7 +3,7 @@
 
 Запуск из корня репозитория (нужны dbc.sqlite, .env и свежий risk --json):
     replay/target/release/dbc-replay dbc.sqlite risk --json > /tmp/risk_new.json
-    python3 post_migration.py [cluster_id] [pools] [max_tx_per_pool] [-v] [--tokens=PREFIX1,PREFIX2]
+    python3 post_migration.py [cluster_id] [pools] [max_tx_per_pool] [-v] [--tokens=PREFIX1,PREFIX2] [--ungraduated]
     (-v: печатать каждую транзакцию после завершения кривой)
 
 Для выборки выпустившихся пулов кластера:
@@ -27,8 +27,10 @@ from collections import defaultdict
 
 VERBOSE = "-v" in sys.argv
 # --tokens=7Akd4rsT,AwmnQC3U — разобрать конкретные токены (начала адресов минтов)
+# --ungraduated — брать и невыпустившиеся пулы (для них разбирается только кривая)
+UNGRADUATED = "--ungraduated" in sys.argv
 TOKENS = next((a.split("=", 1)[1].split(",") for a in sys.argv[1:] if a.startswith("--tokens=")), [])
-ARGS = [a for a in sys.argv[1:] if a != "-v" and not a.startswith("--tokens=")]
+ARGS = [a for a in sys.argv[1:] if a not in ("-v", "--ungraduated") and not a.startswith("--tokens=")]
 CLUSTER = ARGS[0] if len(ARGS) > 0 else "5"
 SAMPLE = int(ARGS[1]) if len(ARGS) > 1 else 15
 MAX_TX = int(ARGS[2]) if len(ARGS) > 2 else 600
@@ -187,10 +189,11 @@ def main():
         for pre in TOKENS:
             sample += db.execute(
                 """SELECT p.pool, p.base_mint, c.block_time, p.created_time FROM pools p
-                   JOIN curve_complete c ON c.pool = p.pool WHERE p.base_mint LIKE ? LIMIT 1""", (pre + "%",)).fetchall()
+                   LEFT JOIN curve_complete c ON c.pool = p.pool WHERE p.base_mint LIKE ? LIMIT 1""", (pre + "%",)).fetchall()
     else:
         sample = db.execute(
-        f"""SELECT p.pool, p.base_mint, c.block_time, p.created_time FROM pools p JOIN curve_complete c ON c.pool = p.pool
+        f"""SELECT p.pool, p.base_mint, c.block_time, p.created_time FROM pools p
+            {"LEFT JOIN" if UNGRADUATED else "JOIN"} curve_complete c ON c.pool = p.pool
             WHERE p.config IN ({ph}) AND p.tracked = 1 AND p.created_time BETWEEN ? AND ?
             ORDER BY RANDOM() LIMIT ?""",
         cfgs + [now - 5 * 86400, now - 86400, SAMPLE]).fetchall()
@@ -199,10 +202,13 @@ def main():
     print(f"\n{'token':<9} {'curve tx':>8} {'damm tx':>8} {'span':>8} | {'op curve':>8} {'LP out':>7} {'op damm':>8} "
           f"{'farm vol':>8} | {'OPERATOR':>8} | {'ext curve':>9} {'ext damm':>8} {'ext buys':>8}")
     for pool, mint, grad_time, created in sample:
+        graduated = grad_time is not None
+        if not graduated:
+            grad_time = int(time.time())  # кривая не завершена: разбираем только её
         try:
             # полный цикл: история пула DBC (создание, кривая, миграция) и пула DAMM v2 после неё
             curve_sigs = signatures_after(pool, (created or grad_time) - 120, MAX_TX)[:MAX_TX]
-            sigs = signatures_after(mint, grad_time)[:200]
+            sigs = signatures_after(mint, grad_time)[:200] if graduated else []
             damm = None
             for s0 in sigs:
                 tx0 = rpc("getTransaction", [s0["signature"], {"encoding": "json", "maxSupportedTransactionVersion": 1}])
@@ -265,7 +271,8 @@ def main():
         total["pools"] += 1
         tc = f"{len(curve_sigs)}{'+' if len(curve_sigs) >= MAX_TX else ''}"
         td = f"{len(damm_sigs)}{'+' if len(damm_sigs) >= MAX_TX else ''}"
-        print(f"{mint[:8]:<9} {tc:>8} {td:>8} {last_t - grad_time:>7}s | {st['op_curve']:>+8.3f} {st['lp_out']:>7.3f} "
+        span = f"{last_t - grad_time:>7}s" if graduated else "  no grad"
+        print(f"{mint[:8]:<9} {tc:>8} {td:>8} {span} | {st['op_curve']:>+8.3f} {st['lp_out']:>7.3f} "
               f"{st['op_damm']:>+8.3f} {st['farm_vol']:>8.1f} | {op:>+8.3f} | {st['ext_curve']:>+9.3f} {st['ext_damm']:>+8.3f} "
               f"{int(st['ext_buys']):>8}")
 
