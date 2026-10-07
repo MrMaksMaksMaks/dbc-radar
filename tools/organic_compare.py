@@ -77,7 +77,9 @@ def main():
     min_h, max_h, min_tr = float(opt("min-hours", "2")), float(opt("max-hours", "48")), int(opt("min-trades", "5"))
     random.seed(int(opt("seed", "7")))
 
-    verdict_of = {r["config"]: r["verdict"] for r in json.load(open("/tmp/risk_new.json"))}
+    risk = json.load(open("/tmp/risk_new.json"))
+    verdict_of = {r["config"]: r["verdict"] for r in risk}
+    cluster_of = {r["config"]: (r["cluster"], r["cluster_size"]) for r in risk}
     db = sqlite3.connect("dbc.sqlite")
     now = int(time.time())
     rows = db.execute(
@@ -125,15 +127,37 @@ def main():
         print(f"{v:<10} {n:>6} {len(ts):>6} | {med} {mean} | {b[0]:>4} {b[1]:>5} {b[2]:>5} {b[3]:>4} | "
               f"{'/'.join(map(str, lab)):>18} | {sus:>5}")
 
+    # совпадение по кластерам: не один ли это оператор
+    for v in ("RED", "RED-LINK"):
+        by = {}
+        for s_ in sample:
+            if s_[0] != v or s_[1] not in info:
+                continue
+            cl = cluster_of.get(s_[2], (None, 0))
+            e = by.setdefault(cl, [0, 0])
+            e[0] += 1
+            e[1] += "isSus" in (info[s_[1]].get("audit") or {})
+        if by:
+            print(f"\n{v} by operator cluster (cluster #id/size: tokens, flagged isSus by Jupiter):")
+            for (cid, size), (n, sus) in sorted(by.items(), key=lambda x: -x[1][0])[:12]:
+                print(f"  #{cid}/{size}: {n} tokens, {sus} isSus")
+
     # расхождения: что разбирать вручную
     red = [(info[s[1]].get("organicScore") or 0, s) for s in sample if s[0] in ("RED", "RED-LINK") and s[1] in info]
     green = [(info[s[1]].get("organicScore") or 0, s) for s in sample if s[0] == "GREEN" and s[1] in info]
     print("\nRED / RED-LINK with the highest Organic Score (check: what Jupiter counts as organic here):")
     for sc, s in sorted(red, reverse=True)[:5]:
-        print(f"  {s[1]}  score {sc:5.1f}  config {s[2][:8]}  trades {s[4]}")
+        t = info[s[1]]
+        print(f"  {s[1]}  {s[0]:<8} score {sc:5.1f}  isSus {'isSus' in (t.get('audit') or {})}  "
+              f"holders {t.get('holderCount')}  config {s[2][:8]}  trades {s[4]}")
     print("GREEN with the lowest Organic Score:")
     for sc, s in sorted(green)[:5]:
         print(f"  {s[1]}  score {sc:5.1f}  config {s[2][:8]}  trades {s[4]}")
+    flagged_green = [s for s in sample if s[0] == "GREEN" and "isSus" in ((info.get(s[1]) or {}).get("audit") or {})]
+    if flagged_green:
+        print("GREEN flagged isSus by Jupiter (what did it see that we did not?):")
+        for s in flagged_green:
+            print(f"  {s[1]}  config {s[2][:8]}  trades {s[4]}  audit {json.dumps(info[s[1]].get('audit'))[:150]}")
     print("\nnotes: Organic Score is relative (normalised across the ecosystem) — compare groups, not single numbers;"
           "\n       'in Jup' = tokens Jupiter returned; tokens it does not index have no score;"
           "\n       full rows: out/organic_compare.csv")
