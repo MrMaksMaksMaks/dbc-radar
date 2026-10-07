@@ -34,6 +34,22 @@ impl ConfigRisk {
     pub fn verdict(&self) -> String {
         self.s("verdict")
     }
+    /// Флаги с баллами: (баллы, текст).
+    pub fn scored_flags(&self, k: &str) -> Vec<(i64, String)> {
+        self.0
+            .get(k)
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|f| {
+                        let t = f.get("text").and_then(Value::as_str)?;
+                        Some((f.get("points").and_then(Value::as_i64).unwrap_or(0), t.to_owned()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn flags(&self, k: &str) -> Vec<String> {
         self.0
             .get(k)

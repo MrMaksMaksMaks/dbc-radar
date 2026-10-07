@@ -412,7 +412,11 @@ pub fn score(f: &ConfigFacts, b: &Behavior) -> Report {
         }
         if let Some(m) = fs.median_migration_secs {
             if m < 300.0 && !f.instant_graduation {
-                add(&mut ev, 10, format!("median {m:.0} s from launch to migration"));
+                add(
+                    &mut ev,
+                    10,
+                    format!("the curve fills a median {m:.0} s after launch: no time for an open market, early buyers are bots or a bundle"),
+                );
             }
         }
     }

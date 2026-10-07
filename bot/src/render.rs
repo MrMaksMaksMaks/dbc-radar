@@ -56,6 +56,60 @@ fn bullets(lines: &[String], max: usize) -> String {
     out
 }
 
+/// Тревожные признаки (с баллами, от весомых) и информационные строки (без баллов).
+fn risks_and_notes(r: &ConfigRisk) -> (Vec<String>, Vec<String>) {
+    let mut all = r.scored_flags("capability_flags");
+    all.extend(r.scored_flags("evidence_flags"));
+    let mut risks: Vec<(i64, String)> = all.iter().filter(|(p, _)| *p > 0).cloned().collect();
+    risks.sort_by(|a, b| b.0.cmp(&a.0));
+    let notes = all.into_iter().filter(|(p, _)| *p <= 0).map(|(_, t)| t).collect();
+    (risks.into_iter().map(|(_, t)| t).collect(), notes)
+}
+
+/// Положительные факты из конфига и наблюдений — то, что говорит в пользу запуска.
+fn positives(r: &ConfigRisk) -> Vec<String> {
+    let mut out = Vec::new();
+    let locked = r.u("locked_lp_pct");
+    let unlocked = r.u("creator_unlocked_lp_pct") + r.u("partner_unlocked_lp_pct");
+    if locked >= 50 {
+        out.push(format!("{locked}% of post-migration liquidity is permanently locked"));
+    }
+    if unlocked == 0 {
+        out.push("no liquidity can be withdrawn right after migration".to_string());
+    }
+    if let Some(left) = r.f("leftover_to_receiver_pct") {
+        if left < 5.0 {
+            out.push(format!("leftover supply to the receiver is small ({left:.1}%)"));
+        }
+    }
+    let tracked = r.u("tracked");
+    if tracked >= 3 && r.scored_flags("evidence_flags").iter().all(|(p, _)| *p <= 0) {
+        out.push(format!("no creator-linked trading observed in {tracked} tracked pools of this config"));
+    }
+    out
+}
+
+/// Блоки «почему / мелкие сигналы», «в пользу», «заметки» — сначала риски, потом положительное.
+fn reasons(r: &ConfigRisk, max_risks: usize) -> String {
+    let v = r.verdict();
+    let (risks, notes) = risks_and_notes(r);
+    let good = positives(r);
+    let mut s = String::new();
+    if !risks.is_empty() {
+        let title = if v == "GREEN" { "Minor signals (below warning level)" } else { "Why" };
+        s.push_str(&format!("{}\n{}\n", bold(title), bullets(&risks, max_risks)));
+    } else if v != "GREEN" {
+        s.push_str(&format!("{}\n• {}\n\n", bold("Why"), esc(&r.s("verdict_text"))));
+    }
+    if !good.is_empty() {
+        s.push_str(&format!("{}\n{}\n", bold("In its favour"), bullets(&good, 4)));
+    }
+    if !notes.is_empty() {
+        s.push_str(&format!("{}\n{}\n", bold("Notes"), bullets(&notes, 2)));
+    }
+    s
+}
+
 const DISCLAIMER: &str = "Heuristic on-chain analysis of public data. Not financial advice.";
 
 pub fn config_report(r: &ConfigRisk) -> String {
@@ -95,6 +149,10 @@ pub fn config_report(r: &ConfigRisk) -> String {
         s.push_str(&format!("• {}\n", esc("nothing unusual in trading")));
     }
     s.push('\n');
+    let good = positives(r);
+    if !good.is_empty() {
+        s.push_str(&format!("{}\n{}\n", bold("In its favour"), bullets(&good, 4)));
+    }
     s.push_str(&italic(DISCLAIMER));
     s
 }
@@ -139,15 +197,7 @@ pub fn pool_card(p: &PoolInfo, r: Option<&ConfigRisk>) -> String {
     }
 
     if let Some(r) = r {
-        s.push_str(&format!("{}\n", bold("Why")));
-        let mut why: Vec<String> = r.flags("capability_flags").into_iter().take(2).collect();
-        why.extend(r.flags("evidence_flags").into_iter().take(3));
-        if why.is_empty() {
-            s.push_str(&format!("• {}\n", esc("no major red flags in the config or in the operator's other launches")));
-        } else {
-            s.push_str(&bullets(&why, 5));
-        }
-        s.push('\n');
+        s.push_str(&reasons(r, 5));
     }
     s.push_str(&italic(DISCLAIMER));
     s
