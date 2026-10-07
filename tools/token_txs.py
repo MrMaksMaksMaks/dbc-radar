@@ -4,14 +4,16 @@
 Запуск из корня репозитория (нужны dbc.sqlite, .env с HISTORY_RPC_URL на Helius и
 свежий /tmp/risk_new.json):
 
-    python3 tools/token_txs.py <начало адреса минта> [max_tx]
+    python3 tools/token_txs.py <начало адреса минта> [max_tx] [--trace-fanout]
 
 Пишет в out/:
   <mint8>_txs.csv     — по строке на участника транзакции: время, подпись, владелец, роль,
                         действие, изменение SOL и токена, фаза (кривая / миграция / DAMM v2);
   <mint8>_state.json  — пул, конфиг, создатель, текущие резервы, порог миграции, прогресс,
                         время с создания, параметры конфига из отчёта движка;
-  <mint8>_risk.txt    — полный отчёт движка по конфигу.
+  <mint8>_risk.txt    — полный отчёт движка по конфигу;
+  <mint8>_fanout.csv  — с --trace-fanout: для каждого, кто продавал токены, не купив их в пуле,
+                        откуда пришли токены (отправитель, сумма, время) и кто пополнил его SOL.
 
 Методика та же, что в post_migration.py: изменения считаются по владельцам всех аккаунтов
 транзакции, хранилища пулов исключены, ферма — кошельки в 3+ пулах кластера оператора,
@@ -27,10 +29,55 @@ import time
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_argv = sys.argv
+sys.argv = [sys.argv[0]]  # post_migration разбирает argv при импорте — даём ему пустой
 import post_migration as pm  # noqa: E402  (rpc, signatures_after, owner_deltas, uses, kind, b58)
+sys.argv = _argv
 
-PREFIX = sys.argv[1] if len(sys.argv) > 1 else sys.exit("usage: token_txs.py <mint prefix> [max_tx]")
-MAX_TX = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
+ARGV = [a for a in sys.argv[1:] if not a.startswith("--")]
+TRACE_FANOUT = "--trace-fanout" in sys.argv
+PREFIX = ARGV[0] if ARGV else sys.exit("usage: token_txs.py <mint prefix> [max_tx] [--trace-fanout]")
+MAX_TX = int(ARGV[1]) if len(ARGV) > 1 else 5000
+TX_OPTS = {"encoding": "json", "maxSupportedTransactionVersion": 1}
+
+
+def wallet_history(wallet, max_tx=60):
+    """Самые ранние транзакции кошелька, от старых к новым (до max_tx)."""
+    sigs, before = [], None
+    for _ in range(5):
+        o = {"limit": 1000}
+        if before:
+            o["before"] = before
+        page = pm.rpc("getSignaturesForAddress", [wallet, o]) or []
+        sigs += page
+        if len(page) < 1000:
+            break
+        before = page[-1]["signature"]
+    return [s for s in reversed(sigs) if s.get("err") is None][:max_tx]
+
+
+def trace_wallet(wallet, mint):
+    """(откуда токены: отправитель, сумма, время, подпись; кто пополнил SOL: адрес, SOL, время)."""
+    tok_src = sol_src = None
+    for s in wallet_history(wallet):
+        if tok_src and sol_src:
+            break
+        tx = pm.rpc("getTransaction", [s["signature"], TX_OPTS])
+        if not tx:
+            continue
+        sol, tok = pm.owner_deltas(tx, mint)
+        t = tx.get("blockTime")
+        if not sol_src and sol.get(wallet, 0) >= 1_000_000:
+            payers = [(o, d) for o, d in sol.items() if d < 0 and o != wallet and o not in pm.POOL_AUTHORITIES]
+            if payers:
+                o, d = min(payers, key=lambda x: x[1])
+                sol_src = (o, -d / 1e9 if -d < sol[wallet] else sol[wallet] / 1e9, t)
+        if not tok_src and tok.get(wallet, 0) > 0 and not (sol.get(wallet, 0) < -1_000_000):
+            # токены пришли без оплаты SOL — перевод, а не покупка
+            senders = [(o, d) for o, d in tok.items() if d < 0 and o != wallet and o not in pm.POOL_AUTHORITIES]
+            src = min(senders, key=lambda x: x[1])[0] if senders else "(mint or unknown)"
+            tok_src = (src, tok[wallet], t, s["signature"])
+    return tok_src, sol_src
 OFF_BASE_RESERVE, OFF_QUOTE_RESERVE, OFF_FINISH = 8 + 224, 8 + 232, 8 + 336
 
 
@@ -201,7 +248,37 @@ def main():
     with open(base + "_risk.txt", "w") as f:
         f.write(rep.stdout + rep.stderr)
 
-    print(f"rows: {len(rows)}; files: {base}_txs.csv, {base}_state.json, {base}_risk.txt")
+    if TRACE_FANOUT and sold_without_buy:
+        sells = defaultdict(float)
+        for x in rows:
+            if x["action"] == "sell":
+                sells[x["owner"]] += x["sol"]
+        out = []
+        for w in sorted(sold_without_buy, key=lambda o: -sells[o])[:60]:
+            tok_src, sol_src = trace_wallet(w, mint)
+            out.append({
+                "wallet": w,
+                "sold_for_sol": round(sells[w], 6),
+                "tokens_from": tok_src[0] if tok_src else "",
+                "tokens_from_role": role(tok_src[0]) if tok_src else "",
+                "tokens_received": tok_src[1] if tok_src else "",
+                "tokens_received_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(tok_src[2])) if tok_src and tok_src[2] else "",
+                "seconds_from_creation_tokens": (tok_src[2] - created) if (tok_src and tok_src[2] and created) else "",
+                "tokens_tx": tok_src[3] if tok_src else "",
+                "sol_from": sol_src[0] if sol_src else "",
+                "sol_from_role": role(sol_src[0]) if sol_src else "",
+                "sol_received": round(sol_src[1], 6) if sol_src else "",
+                "sol_received_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(sol_src[2])) if sol_src and sol_src[2] else "",
+            })
+            print(f"  fan-out {w[:8]} sold {sells[w]:.3f} SOL; tokens from {(tok_src or ['-'])[0][:8]} ({out[-1]['tokens_from_role']}); "
+                  f"SOL from {(sol_src or ['-'])[0][:8]} ({out[-1]['sol_from_role']})")
+        with open(base + "_fanout.csv", "w", newline="") as f:
+            w_ = csv.DictWriter(f, fieldnames=list(out[0].keys()))
+            w_.writeheader()
+            w_.writerows(out)
+
+    print(f"rows: {len(rows)}; files: {base}_txs.csv, {base}_state.json, {base}_risk.txt"
+          + (f", {base}_fanout.csv" if TRACE_FANOUT and sold_without_buy else ""))
     print(json.dumps({k: state.get(k) for k in ("quote_reserve_now_sol", "migration_threshold_sol", "curve_progress_pct",
                                                  "hours_since_creation", "graduated_utc")}, ensure_ascii=False))
 
