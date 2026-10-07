@@ -6,6 +6,11 @@
 
     replay/target/release/dbc-replay dbc.sqlite risk --json > /tmp/risk_new.json
     python3 tools/organic_compare.py [--per-verdict=30] [--min-hours=2] [--max-hours=48] [--min-trades=5]
+                                     [--per-cluster=N]
+
+--per-cluster=N — выборка, сбалансированная по операторам: для RED и RED-LINK берётся до N
+случайных токенов из КАЖДОГО кластера оператора (а не случайные из всех), чтобы крупнейший
+оператор не составлял большую часть выборки. GREEN и AMBER — как обычно, до per-verdict.
 
 Выборка честная по возрасту и активности: из каждого вердикта (RED, RED-LINK, AMBER, SELF-GRAD,
 GREEN) берутся случайные токены отслеживаемых пулов одного окна возраста и не меньше
@@ -92,12 +97,23 @@ def main():
         v = verdict_of.get(cfg)
         if v in groups and trades >= min_tr:
             groups[v].append((mint, cfg, created, trades))
+    per_cluster = int(opt("per-cluster", "0"))
     sample = []
     for v in VERDICTS:
         random.shuffle(groups[v])
-        sample += [(v, *x) for x in groups[v][:per]]
+        if per_cluster and v in ("RED", "RED-LINK"):
+            taken = {}
+            for x in groups[v]:
+                cid = cluster_of.get(x[1], (None, 0))[0]
+                if taken.get(cid, 0) < per_cluster:
+                    taken[cid] = taken.get(cid, 0) + 1
+                    sample.append((v, *x))
+        else:
+            sample += [(v, *x) for x in groups[v][:per]]
     print(f"tokens {min_h:g}-{max_h:g} h old with >= {min_tr} trades: "
-          + ", ".join(f"{v} {len(groups[v])}" for v in VERDICTS) + f"; sampling up to {per} per verdict")
+          + ", ".join(f"{v} {len(groups[v])}" for v in VERDICTS)
+          + (f"; RED/RED-LINK: up to {per_cluster} per operator cluster, others up to {per} per verdict"
+             if per_cluster else f"; sampling up to {per} per verdict"))
 
     info = jupiter([s[1] for s in sample], key)
     os.makedirs("out", exist_ok=True)
@@ -139,8 +155,13 @@ def main():
             e[1] += "isSus" in (info[s_[1]].get("audit") or {})
         if by:
             print(f"\n{v} by operator cluster (cluster #id/size: tokens, flagged isSus by Jupiter):")
-            for (cid, size), (n, sus) in sorted(by.items(), key=lambda x: -x[1][0])[:12]:
+            for (cid, size), (n, sus) in sorted(by.items(), key=lambda x: -x[1][0])[:40]:
                 print(f"  #{cid}/{size}: {n} tokens, {sus} isSus")
+            agree = sum(1 for n, sus in by.values() if sus * 2 > n)
+            tok = sum(n for n, _ in by.values())
+            sus_t = sum(s_ for _, s_ in by.values())
+            print(f"  -> {len(by)} operator clusters; Jupiter flags the majority of tokens in {agree} of them; "
+                  f"{sus_t} of {tok} tokens flagged overall")
 
     # расхождения: что разбирать вручную
     red = [(info[s[1]].get("organicScore") or 0, s) for s in sample if s[0] in ("RED", "RED-LINK") and s[1] in info]
