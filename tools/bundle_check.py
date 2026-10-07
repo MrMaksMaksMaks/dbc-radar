@@ -96,6 +96,9 @@ def main():
             """SELECT p.pool, p.base_mint, p.creator, p.created_time, p.created_slot FROM pools p
                JOIN curve_complete c ON c.pool = p.pool
                WHERE c.block_time - p.created_time <= ? AND p.created_time > strftime('%s','now') - 3*86400
+                 -- не мгновенная graduation самим создателем: в пуле покупали минимум 3 других кошелька
+                 AND (SELECT COUNT(DISTINCT s.fee_payer) FROM swaps s
+                      WHERE s.pool = p.pool AND s.trade_direction = 1 AND s.fee_payer <> p.creator) >= 3
                ORDER BY RANDOM() LIMIT ?""", (max_secs, n)).fetchall()
     print(f"RPC host {pm.RPC_HOST}; first {SLOTS} slot(s) after creation, up to {MAX_BUYERS} buyers per pool\n")
     print(f"{'token':<9} {'buyers':>6} {'SOL':>7} | {'top sponsor':<10} {'buyers':>6} {'SOL':>7} {'tx':>5} {'is':<16} "
