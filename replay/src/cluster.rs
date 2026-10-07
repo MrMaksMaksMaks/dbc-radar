@@ -103,10 +103,20 @@ pub fn load_info(conn: &Connection, config: &str, raw: &[u8], has_hook: bool) ->
     let creators = st
         .query_map(params![config], |r| r.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    // сателлиты — продавцы без покупки, но только в пулах, где они продали не больше токенов,
+    // чем купил создатель (иначе раздача не от оператора: например, снайпер раздал своим кошелькам)
     let mut st = conn.prepare_cached(
-        "SELECT DISTINCT s.fee_payer FROM swaps s JOIN pools p ON p.pool = s.pool
-         WHERE p.config = ?1 AND s.trade_direction = 0 AND s.fee_payer <> p.creator
-           AND s.fee_payer NOT IN (SELECT fee_payer FROM swaps b WHERE b.pool = s.pool AND b.trade_direction = 1)",
+        "WITH fs AS (
+             SELECT s.pool, s.fee_payer, s.included_fee_input_amount AS t
+             FROM swaps s JOIN pools p ON p.pool = s.pool
+             WHERE p.config = ?1 AND s.trade_direction = 0 AND s.fee_payer <> p.creator
+               AND s.fee_payer NOT IN (SELECT fee_payer FROM swaps b WHERE b.pool = s.pool AND b.trade_direction = 1)),
+         ok AS (
+             SELECT fs.pool FROM fs GROUP BY fs.pool
+             HAVING SUM(fs.t) * 100 <= 105 * (
+                 SELECT COALESCE(SUM(c.output_amount), 0) FROM swaps c JOIN pools p2 ON p2.pool = c.pool
+                 WHERE c.pool = fs.pool AND c.trade_direction = 1 AND c.fee_payer = p2.creator))
+         SELECT DISTINCT fee_payer FROM fs WHERE pool IN (SELECT pool FROM ok)",
     )?;
     let satellites = st
         .query_map(params![config], |r| r.get::<_, String>(0))?

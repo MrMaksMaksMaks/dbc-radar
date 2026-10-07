@@ -84,6 +84,9 @@ pub struct FarmStats {
     /// по активным пулам: SOL, оставленные внешними кошельками на кривой (покупки − продажи;
     /// положительное — внешние внесли больше, чем вывели). Только для исследований (--research).
     pub external_net_per_pool: Vec<f64>,
+    /// пулы, где продавцы без покупки продали больше токенов, чем купил создатель
+    /// (раздача не от оператора — не считается связанной)
+    pub unattributed_fanout_pools: usize,
     /// по активным пулам: (SOL, которые связанные кошельки — создатель, раздача, ферма, мастера —
     /// вывели с кривой сверх вложенного; пул выпустился; время создания). Положительное — оператор забрал чужие
     /// деньги на кривой. Только для исследований (--research).
@@ -256,11 +259,15 @@ pub fn analyze_loaded(data: &ScopeData, metrics: &[String], idx: &WalletIndex, m
     let mut dev_buys: Vec<u64> = Vec::new();
     // первые покупки не от создателя (до 5 на пул): кошелёк и сумма, по порядку
     let mut opening: Vec<Vec<(&str, u64)>> = Vec::with_capacity(n);
+    let mut unattributed_fanout = 0usize;
     for p in pools.iter() {
         let buyers: HashSet<&str> = p.swaps.iter().filter(|s| s.buy).map(|s| s.wallet.as_str()).collect();
         let mut seen: HashSet<&str> = HashSet::new();
         let mut early: HashSet<&str> = HashSet::new();
         let mut fanout: HashSet<&str> = HashSet::new();
+        // токены, купленные создателем, и токены, проданные раздачей: на кривой токены можно
+        // получить только покупкой, так что создатель не мог раздать больше, чем купил
+        let (mut creator_tokens, mut fanout_tokens) = (0u128, 0u128);
         let mut dev = 0u64;
         let mut first: Vec<(&str, u64)> = Vec::new();
         for s in &p.swaps {
@@ -268,6 +275,9 @@ pub fn analyze_loaded(data: &ScopeData, metrics: &[String], idx: &WalletIndex, m
             if w == p.creator {
                 if s.buy && s.slot <= p.created_slot + 2 {
                     dev += s.input;
+                }
+                if s.buy {
+                    creator_tokens += s.output as u128;
                 }
                 continue;
             }
@@ -281,6 +291,7 @@ pub fn analyze_loaded(data: &ScopeData, metrics: &[String], idx: &WalletIndex, m
             }
             if !s.buy && !buyers.contains(w) {
                 fanout.insert(w);
+                fanout_tokens += s.input as u128;
             }
         }
         let is_metric = metric_set.contains(p.config.as_str());
@@ -298,6 +309,14 @@ pub fn analyze_loaded(data: &ScopeData, metrics: &[String], idx: &WalletIndex, m
         }
         if dev > 0 && metric_set.contains(p.config.as_str()) {
             dev_buys.push(dev);
+        }
+        // раздача продала больше, чем создатель купил: источник — другой покупатель (например,
+        // снайпер, раздавший токены своим кошелькам), не оператор
+        if fanout_tokens * 100 > creator_tokens * 105 {
+            if !fanout.is_empty() && metric_set.contains(p.config.as_str()) {
+                unattributed_fanout += 1;
+            }
+            fanout.clear();
         }
         fanout_per_pool.push(fanout);
         opening.push(first);
@@ -446,6 +465,7 @@ pub fn analyze_loaded(data: &ScopeData, metrics: &[String], idx: &WalletIndex, m
     out.median_migration_secs = median(mig);
     out.median_linked_share = if shares.len() >= MIN_POOLS.min(out.pools.max(1)) { median(shares) } else { None };
     out.median_fanout = median(fanouts);
+    out.unattributed_fanout_pools = unattributed_fanout;
     out
 }
 
@@ -557,6 +577,36 @@ mod tests {
         assert!(m.operator_net_per_pool.iter().all(|(x, grad, _)| (x + 5.0).abs() < 1e-9 && !grad));
         let r = analyze_config(&conn, "R", &idx, 0).unwrap();
         assert_eq!(r.master_wallets, 0, "a relayer signing for many users is not a master");
+    }
+
+    #[test]
+    fn fanout_by_a_sniper_is_not_the_operators() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pools(pool, config, creator, created_time, created_slot, tracked);
+             CREATE TABLE swaps(pool, fee_payer, trade_direction, included_fee_input_amount, output_amount, slot, event_index);
+             CREATE TABLE curve_complete(pool, block_time);",
+        )
+        .unwrap();
+        let sw = |pool: &str, w: &str, buy: bool, i: i64, o: i64| {
+            conn.execute("INSERT INTO swaps VALUES(?1,?2,?3,?4,?5,140,0)", params![pool, w, if buy { 1 } else { 0 }, i, o]).unwrap();
+        };
+        for k in 0..3 {
+            let p = format!("S{k}");
+            conn.execute("INSERT INTO pools VALUES(?1,'SN','DEV',1000,100,1)", params![p]).unwrap();
+            sw(&p, "DEV", true, 300_000_000, 10_000); // создатель купил 10 000 токенов
+            sw(&p, &format!("SNIPER{k}"), true, 15_000_000_000, 300_000); // снайпер купил 300 000
+            for j in 0..5 {
+                // кошельки снайпера продают по 50 000 токенов, которых не покупали в пуле
+                sw(&p, &format!("SUB{k}_{j}"), false, 50_000, 1_000_000_000);
+            }
+            sw(&p, &format!("EXT{k}"), true, 100_000_000, 2_000);
+        }
+        let idx = wallet_index(&conn).unwrap();
+        let f = analyze_config(&conn, "SN", &idx, 0).unwrap();
+        assert_eq!(f.unattributed_fanout_pools, 3);
+        assert_eq!(f.median_fanout, Some(0.0), "a sniper's own fan-out is not linked to the operator");
+        assert!(f.median_linked_share.unwrap_or(0.0) < 0.1);
     }
 
     #[test]

@@ -180,10 +180,15 @@ pub fn behavior(conn: &Connection, config: &str, threshold: u64) -> Result<Behav
     let mut ow = Vec::new();
     let mut osol = Vec::new();
     let mut outside = conn.prepare(
-        "SELECT COUNT(DISTINCT s.fee_payer), COALESCE(SUM(s.output_amount), 0)
+        "SELECT COUNT(DISTINCT s.fee_payer), COALESCE(SUM(s.output_amount), 0), COALESCE(SUM(s.included_fee_input_amount), 0)
          FROM swaps s JOIN pools p ON p.pool = s.pool
          WHERE s.pool = ?1 AND s.trade_direction = 0 AND s.fee_payer <> p.creator
            AND s.fee_payer NOT IN (SELECT fee_payer FROM swaps b WHERE b.pool = ?1 AND b.trade_direction = 1)",
+    )?;
+    // сколько токенов купил создатель: раздать на кривой он может не больше
+    let mut creator_bought = conn.prepare(
+        "SELECT COALESCE(SUM(s.output_amount), 0) FROM swaps s JOIN pools p ON p.pool = s.pool
+         WHERE s.pool = ?1 AND s.trade_direction = 1 AND s.fee_payer = p.creator",
     )?;
     for (pool, pb, grad, n_swaps) in rows {
         if n_swaps == 0 {
@@ -196,9 +201,17 @@ pub fn behavior(conn: &Connection, config: &str, threshold: u64) -> Result<Behav
         if threshold > 0 {
             prebuy.push(100.0 * pb as f64 / threshold as f64);
         }
-        let (w, sol): (i64, i64) = outside.query_row(params![pool], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        ow.push(w as f64);
-        osol.push(sol as f64 / 1e9);
+        let (w, sol, tokens): (i64, i64, i64) = outside.query_row(params![pool], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let bought: i64 = creator_bought.query_row(params![pool], |r| r.get(0))?;
+        // продавцы без покупки продали больше, чем купил создатель: раздача не от оператора
+        // (например, снайпер раздал купленное своим кошелькам) — не считаем её признаком
+        if (tokens as i128) * 100 > (bought as i128) * 105 {
+            ow.push(0.0);
+            osol.push(0.0);
+        } else {
+            ow.push(w as f64);
+            osol.push(sol as f64 / 1e9);
+        }
     }
     b.median_prebuy_pct = median(prebuy);
     b.median_outside_wallets = median(ow);
