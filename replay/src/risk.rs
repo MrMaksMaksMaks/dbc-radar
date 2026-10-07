@@ -365,7 +365,15 @@ pub fn score(f: &ConfigFacts, b: &Behavior) -> Report {
     }
     if let Some(fs) = &b.farm {
         if let Some(sh) = fs.median_linked_share {
-            if sh >= 0.8 {
+            let only_creator = fs.farm_wallets < 3 && fs.master_wallets == 0;
+            if sh >= 0.8 && only_creator {
+                // почти весь объём — сделки самого создателя: другие почти не торгуют
+                // (брошенный запуск или продажа внешним), это не производство объёма фермой
+                add(&mut ev, 20, format!(
+                    "{:.0}% of trading volume (median per pool) comes from the creator itself: few other traders",
+                    sh * 100.0
+                ));
+            } else if sh >= 0.8 {
                 let masters = if fs.master_wallets > 0 {
                     format!(" and {} wallet(s) trading through proxy signers", fs.master_wallets)
                 } else {
@@ -450,8 +458,12 @@ pub fn score(f: &ConfigFacts, b: &Behavior) -> Report {
     // или массовая раздача (10+ продавцов без покупок на пул). Сумма слабых признаков (около
     // половины связанного объёма, один создатель, одинаковая первая покупка) RED не даёт:
     // вердикт тогда определяется конфигом, а признаки остаются видны в отчёте.
+    // 80% связанного объёма засчитывается, только если связаны не один создатель:
+    // 3+ кошелька фермы или мастер-кошелёк с прокси (иначе это объём самого создателя).
     let strong_trading = b.median_outside_wallets.unwrap_or(0.0) >= 10.0
-        || b.farm.as_ref().and_then(|fs| fs.median_linked_share).unwrap_or(0.0) >= 0.8;
+        || b.farm.as_ref().is_some_and(|fs| {
+            fs.median_linked_share.unwrap_or(0.0) >= 0.8 && (fs.farm_wallets >= 3 || fs.master_wallets >= 1)
+        });
     let verdict = if evidence.unwrap_or(0) >= 50 && strong_trading {
         Verdict::Synthetic
     } else if self_grad {
@@ -566,6 +578,18 @@ mod tests {
             ..Default::default()
         };
         let rw = score(&f, &weak);
+        // почти весь объём — сделки создателя, ферм и мастеров нет: не RED
+        let creator_only = Behavior {
+            pools: 8,
+            creators: 1,
+            tracked: 1,
+            median_outside_wallets: Some(0.0),
+            farm: Some(crate::farm::FarmStats { median_linked_share: Some(0.99), ..Default::default() }),
+            ..Default::default()
+        };
+        let rc = score(&f, &creator_only);
+        assert_ne!(rc.verdict, Verdict::Synthetic, "creator's own trades in a pool nobody else trades are not synthetic volume");
+        assert!(rc.evidence_flags.iter().any(|x| x.text.contains("creator itself")));
         assert!(rw.evidence.unwrap() >= 50, "weak signals add up: {:?}", rw.evidence);
         assert_eq!(rw.verdict, Verdict::RugCapable, "weak signals do not make RED; the risky config gives AMBER");
 
