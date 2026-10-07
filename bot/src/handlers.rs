@@ -118,7 +118,7 @@ async fn onchain_view(state: &State, addr: &str) -> View {
                 match state.rpc.resolve(&mint).await {
                     Ok(Lookup::Found(found)) => found_view(state, &found, &mint).await,
                     Ok(Lookup::OtherLaunchpad(lp, by_suffix)) => other_launchpad(lp, by_suffix),
-                    Ok(Lookup::MintWithoutHistory) => mint_without_history(),
+                    Ok(Lookup::MintWithoutHistory) => pool_token_without_dbc_launch(venue),
                     Ok(_) => not_found(&mint),
                     Err(e) => err_view(e),
                 }
@@ -152,6 +152,22 @@ fn other_launchpad(lp: &str, by_suffix: bool) -> View {
         format!(
             "{}\n\n{}",
             esc(&format!("This token was launched on {lp}{how}, not on Meteora DBC.")),
+            esc("DBC Radar checks launches on Meteora's Dynamic Bonding Curve: who can withdraw liquidity after graduation and whether trading is real.")
+        ),
+        Some(kb::back_home()),
+    )
+}
+
+/// Пользователь прислал пул Meteora, а у его токена нет запуска на DBC в доступной истории:
+/// совет «пришлите пул» здесь не нужен — пул он уже прислал.
+fn pool_token_without_dbc_launch(venue: &str) -> View {
+    (
+        format!(
+            "{}\n\n{}",
+            esc(&format!(
+                "We found no Meteora DBC launch for the token of this {venue} pool: the token was most likely created \
+                 on another launchpad or directly with a {venue} pool, or launched before the transaction history available to us."
+            )),
             esc("DBC Radar checks launches on Meteora's Dynamic Bonding Curve: who can withdraw liquidity after graduation and whether trading is real.")
         ),
         Some(kb::back_home()),
