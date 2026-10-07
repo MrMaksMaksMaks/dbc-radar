@@ -81,6 +81,9 @@ pub struct FarmStats {
     pub master_wallets: usize,
     /// медиана по пулам: доля объёма, за которую платил не подписант (мастер через прокси)
     pub median_proxied_share: Option<f64>,
+    /// по активным пулам: SOL, оставленные внешними кошельками на кривой (покупки − продажи;
+    /// положительное — внешние внесли больше, чем вывели). Только для исследований (--research).
+    pub external_net_per_pool: Vec<f64>,
 }
 
 impl FarmStats {
@@ -388,6 +391,7 @@ pub fn analyze_loaded(data: &ScopeData, metrics: &[String], idx: &WalletIndex, m
             .collect();
         all_masters.extend(masters.iter().copied());
         let (mut total, mut linked, mut proxied) = (0u64, 0u64, 0u64);
+        let (mut ext_buy, mut ext_sell) = (0u64, 0u64);
         let non_creator = p.swaps.iter().filter(|s| s.wallet != p.creator).count();
         for s in &p.swaps {
             let v = sol_volume(s);
@@ -405,8 +409,10 @@ pub fn analyze_loaded(data: &ScopeData, metrics: &[String], idx: &WalletIndex, m
                 external.insert(w);
                 if s.buy {
                     out.external_buy_lamports += s.input;
+                    ext_buy += s.input;
                 } else {
                     out.external_sell_lamports += s.output;
+                    ext_sell += s.output;
                 }
             }
         }
@@ -416,6 +422,7 @@ pub fn analyze_loaded(data: &ScopeData, metrics: &[String], idx: &WalletIndex, m
             out.active_pools += 1;
             shares.push(linked as f64 / total as f64);
             proxied_shares.push(proxied as f64 / total as f64);
+            out.external_net_per_pool.push((ext_buy as f64 - ext_sell as f64) / 1e9);
         }
     }
     out.master_wallets = all_masters.len();
@@ -528,6 +535,9 @@ mod tests {
         assert_eq!(m.master_wallets, 1);
         assert!(m.median_linked_share.unwrap() > 0.99, "master volume is linked: {:?}", m.median_linked_share);
         assert!(m.median_proxied_share.unwrap() > 0.99);
+        // внешний кошелёк EXTk купил на 0,01 SOL в каждом из 3 пулов и ничего не продал
+        assert_eq!(m.external_net_per_pool.len(), 3);
+        assert!(m.external_net_per_pool.iter().all(|x| (x - 0.01).abs() < 1e-9));
         let r = analyze_config(&conn, "R", &idx, 0).unwrap();
         assert_eq!(r.master_wallets, 0, "a relayer signing for many users is not a master");
     }

@@ -684,6 +684,29 @@ fn sort_rows(rows: &mut [&RiskRow]) {
     });
 }
 
+/// Поля для исследований: что внешние кошельки оставили на кривой, по активным пулам конфига.
+fn research_json(r: &RiskRow) -> String {
+    let Some(fs) = r.beh.farm.as_ref() else { return ",\"research\":null".to_string() };
+    let mut v = fs.external_net_per_pool.clone();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let q = |p: f64| if v.is_empty() { 0.0 } else { v[((v.len() - 1) as f64 * p).round() as usize] };
+    format!(
+        ",\"research\":{{\"active_pools\":{},\"external_wallets\":{},\"external_net_sol\":{:.4},\"external_net_median\":{:.4},\"external_net_p90\":{:.4},\"external_net_max\":{:.4},\"pools_external_net_over_1\":{},\"pools_external_net_over_5\":{},\"median_linked_share\":{},\"farm_wallets\":{},\"master_wallets\":{},\"total_volume_sol\":{:.2}}}",
+        v.len(),
+        fs.external_wallets,
+        v.iter().sum::<f64>(),
+        q(0.5),
+        q(0.9),
+        v.last().copied().unwrap_or(0.0),
+        v.iter().filter(|x| **x >= 1.0).count(),
+        v.iter().filter(|x| **x >= 5.0).count(),
+        fs.median_linked_share.map(|x| format!("{x:.3}")).unwrap_or_else(|| "null".into()),
+        fs.farm_wallets,
+        fs.master_wallets,
+        fs.total_volume_lamports as f64 / 1e9,
+    )
+}
+
 fn template_summary(r: &RiskRow) -> String {
     let f = &r.facts;
     format!(
@@ -709,12 +732,15 @@ fn run_risk(conn: &rusqlite::Connection, args: &Args) -> Result<()> {
     sort_rows(&mut rows);
 
     if args.has("--json") {
+        // --research: поля для исследований (деньги внешних по пулам); бот их не запрашивает,
+        // поэтому в карточки и API они не попадают
+        let research = args.has("--research");
         let opt = |v: Option<f64>| v.map(|x| format!("{x:.4}")).unwrap_or_else(|| "null".into());
         let items: Vec<String> = rows
             .iter()
             .map(|r| {
                 format!(
-                    "{{\"config\":{},\"quote_mint\":{},\"verdict\":\"{}\",\"verdict_text\":{},\"capability\":{},\"evidence\":{},\"cluster\":{},\"cluster_size\":{},\"template\":\"{}\",\"pools\":{},\"creators\":{},\"top_creator\":{},\"tracked\":{},\"graduated\":{},\"creator_unlocked_lp_pct\":{},\"partner_unlocked_lp_pct\":{},\"locked_lp_pct\":{},\"vested_lp_pct\":{},\"vest_full_release_secs\":{},\"leftover_to_receiver_pct\":{:.2},\"transfer_hook\":{},\"instant_graduation\":{},\"fee_claimer\":{},\"leftover_receiver\":{},\"leftover_receiver_configs\":{},\"median_prebuy_pct\":{},\"median_outside_wallets\":{},\"median_outside_sol\":{},\"capability_flags\":{},\"evidence_flags\":{}}}",
+                    "{{\"config\":{},\"quote_mint\":{},\"verdict\":\"{}\",\"verdict_text\":{},\"capability\":{},\"evidence\":{},\"cluster\":{},\"cluster_size\":{},\"template\":\"{}\",\"pools\":{},\"creators\":{},\"top_creator\":{},\"tracked\":{},\"graduated\":{},\"creator_unlocked_lp_pct\":{},\"partner_unlocked_lp_pct\":{},\"locked_lp_pct\":{},\"vested_lp_pct\":{},\"vest_full_release_secs\":{},\"leftover_to_receiver_pct\":{:.2},\"transfer_hook\":{},\"instant_graduation\":{},\"fee_claimer\":{},\"leftover_receiver\":{},\"leftover_receiver_configs\":{},\"median_prebuy_pct\":{},\"median_outside_wallets\":{},\"median_outside_sol\":{},\"capability_flags\":{},\"evidence_flags\":{}{}}}",
                     json_escape(&r.config),
                     r.quote_mint.as_deref().map(json_escape).unwrap_or_else(|| "null".into()),
                     r.rep.verdict.label(),
@@ -745,6 +771,7 @@ fn run_risk(conn: &rusqlite::Connection, args: &Args) -> Result<()> {
                     opt(r.beh.median_outside_sol),
                     flags_json(&r.rep.capability_flags),
                     flags_json(&r.rep.evidence_flags),
+                    if research { research_json(r) } else { String::new() },
                 )
             })
             .collect();
