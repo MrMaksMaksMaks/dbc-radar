@@ -496,6 +496,14 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
         let (total, reds) = addr_stats.get(&(kind, addr.to_string())).copied().unwrap_or((1, 0));
         total >= risk::PLATFORM_MIN_CONFIGS && reds * 2 < total
     };
+    // Для переноса риска общий получатель комиссий или остатка — адрес оператора, только если
+    // синтетика наблюдается не меньше чем в половине его конфигов, при любом их числе.
+    // Небольшой лаунчпад (5 конфигов, синтетика в 2) не окрашивает свои честные конфиги;
+    // новый конфиг оператора с адресом его RED-конфига (1 из 2) связь сохраняет.
+    let is_operator_address = |kind: cluster::LinkKind, addr: &str| -> bool {
+        let (total, reds) = addr_stats.get(&(kind, addr.to_string())).copied().unwrap_or((1, 0));
+        reds * 2 >= total
+    };
 
     // Получатель остатка, общий для многих конфигов, по умолчанию считается адресом платформы
     // (хранение у платформы безопаснее); если это адрес оператора — снимаем эту скидку.
@@ -547,7 +555,7 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
                 ] {
                     if let (Some(a), Some(b)) = (a, b) {
                         if a == b {
-                            if is_platform(kind, a) {
+                            if !is_operator_address(kind, a) {
                                 platform_kinds.insert(kind);
                                 platform = true;
                             } else {
@@ -601,7 +609,7 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
                 r.rep.evidence_flags.push(risk::Flag {
                     points: 0,
                     text: format!(
-                        "same launchpad address ({}) as {} config(s) where trading is dominated by creator-linked wallets; a shared platform address is not treated as a link",
+                        "shares a fee/leftover address ({}) with {} config(s) where trading is dominated by creator-linked wallets; most configs using that address show no such trading, so it is not treated as a link",
                         labels(&platform_kinds),
                         platform_n
                     ),
