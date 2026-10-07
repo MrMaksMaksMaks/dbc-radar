@@ -48,7 +48,7 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args> {
-    let usage = "usage: dbc-replay <dbc.sqlite> <pool prefix> [--cf ...]\n       dbc-replay <dbc.sqlite> risk [config prefix] [--json] [--limit N]\n       dbc-replay <dbc.sqlite> clusters [config prefix]\n       dbc-replay <dbc.sqlite> templates\n       dbc-replay <dbc.sqlite> impact [--since-hours N] [--sol-usd 122]";
+    let usage = "usage: dbc-replay <dbc.sqlite> <pool prefix> [--cf ...]\n       dbc-replay <dbc.sqlite> risk [config prefix] [--json [--research]] [--limit N]\n       dbc-replay <dbc.sqlite> clusters [config prefix]\n       dbc-replay <dbc.sqlite> templates\n       dbc-replay <dbc.sqlite> impact [--since-hours N] [--sol-usd 122]";
     let mut flags = HashMap::new();
     let mut switches = Vec::new();
     let mut positional = Vec::new();
@@ -61,7 +61,7 @@ fn parse_args() -> Result<Args> {
             i += 1;
             continue;
         }
-        let takes_value = !matches!(a.as_str(), "--cf" | "--verbose" | "--json");
+        let takes_value = !matches!(a.as_str(), "--cf" | "--verbose" | "--json" | "--research");
         if takes_value {
             let v = rest.get(i + 1).with_context(|| format!("{a} needs a value"))?;
             flags.insert(a.clone(), v.clone());
