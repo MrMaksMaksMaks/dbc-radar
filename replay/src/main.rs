@@ -856,7 +856,12 @@ fn run_risk(conn: &rusqlite::Connection, args: &Args) -> Result<()> {
         );
         println!("  migration fee        {}%", f.migration_fee_pct);
         println!("  transfer hook        {}", f.transfer_hook.as_deref().unwrap_or("none"));
-        println!("  anti-sniper fee      {}", if f.has_fee_scheduler { "fee scheduler on" } else { "none (flat fee)" });
+        println!("  trading fee          {}", risk::describe_base_fee(f));
+        println!(
+            "  trading fee split    protocol 20%; of the rest creator {}%, partner (fee claimer) {}%",
+            f.creator_trading_fee_pct,
+            100u8.saturating_sub(f.creator_trading_fee_pct)
+        );
         println!("  token authority      {}", match f.update_authority {
             0 => "creator can update metadata",
             1 => "immutable",

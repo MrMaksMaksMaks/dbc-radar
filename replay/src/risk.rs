@@ -44,6 +44,13 @@ pub struct ConfigFacts {
     pub transfer_hook: Option<String>,
     /// порог миграции ~0 при quote = SOL: кривой как рынка нет, токен сразу уходит в DAMM v2
     pub instant_graduation: bool,
+    /// базовая торговая комиссия: (режим 0 линейный / 1 экспоненциальный / 2 ограничитель,
+    /// начальный числитель из 1e9, число периодов, длина периода, снижение за период)
+    pub base_fee: (u8, u64, u16, u64, u64),
+    /// 0 — периоды в слотах, 1 — в секундах
+    pub activation_type: u8,
+    /// доля создателя в торговой комиссии после доли протокола (остальное — партнёру)
+    pub creator_trading_fee_pct: u8,
     pub fee_claimer: Option<String>,
     pub leftover_receiver: Option<String>,
     /// во скольких конфигах базы этот адрес — получатель остатка (>= PLATFORM_MIN_CONFIGS: адрес платформы)
@@ -107,6 +114,9 @@ pub fn config_facts(c: &PoolConfig) -> ConfigFacts {
         update_authority: c.token_update_authority,
         migration_fee_pct: c.migration_fee_percentage,
         has_fee_scheduler: bf.base_fee_mode <= 1 && bf.first_factor > 0 && bf.second_factor > 0,
+        base_fee: (bf.base_fee_mode, bf.cliff_fee_numerator, bf.first_factor, bf.second_factor, bf.third_factor),
+        activation_type: c.activation_type,
+        creator_trading_fee_pct: c.creator_trading_fee_percentage,
         threshold: c.migration_quote_threshold,
         token_decimal: c.token_decimal,
         transfer_hook: None,
@@ -647,4 +657,30 @@ mod tests {
         let pr = score(&plat, &Behavior { pools: 38, creators: 1, ..Default::default() });
         assert_eq!((pr.verdict, pr.capability), (Verdict::Standard, 5), "{:?}", pr.capability_flags);
     }
+}
+
+/// Описание базовой комиссии для отчёта: начальная ставка, как и за сколько снижается, конечная.
+pub fn describe_base_fee(f: &ConfigFacts) -> String {
+    let (mode, cliff, n, freq, red) = f.base_fee;
+    let pct = |num: f64| num / 1e7; // числитель из 1e9 -> проценты
+    if !f.has_fee_scheduler {
+        return format!("flat {:.2}%", pct(cliff as f64));
+    }
+    let end = match mode {
+        0 => (cliff as f64 - n as f64 * red as f64).max(0.0),
+        _ => cliff as f64 * (1.0 - red as f64 / 10_000.0).powi(n as i32),
+    };
+    let unit = if f.activation_type == 1 { "s" } else { "slots" };
+    format!(
+        "{} fee scheduler: starts at {:.2}%, falls {} over {} periods of {} {} ({} {} in total), ends at {:.2}%",
+        if mode == 0 { "linear" } else { "exponential" },
+        pct(cliff as f64),
+        if mode == 0 { format!("by {:.3} pp per period", pct(red as f64)) } else { format!("by {:.2}% per period", red as f64 / 100.0) },
+        n,
+        freq,
+        unit,
+        n as u64 * freq,
+        unit,
+        pct(end)
+    )
 }
