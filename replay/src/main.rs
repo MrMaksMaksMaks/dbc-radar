@@ -687,11 +687,33 @@ fn sort_rows(rows: &mut [&RiskRow]) {
 /// Поля для исследований: что внешние кошельки оставили на кривой, по активным пулам конфига.
 fn research_json(r: &RiskRow) -> String {
     let Some(fs) = r.beh.farm.as_ref() else { return ",\"research\":null".to_string() };
+    // оператор: что связанные кошельки вывели с кривой сверх вложенного, отдельно по
+    // невыпустившимся пулам (там это чистое изъятие у остальных) и по выпустившимся
+    let op_open: Vec<f64> = fs.operator_net_per_pool.iter().filter(|x| !x.1).map(|x| x.0).collect();
+    let op_grad: Vec<f64> = fs.operator_net_per_pool.iter().filter(|x| x.1).map(|x| x.0).collect();
+    let med = |w: &[f64]| -> f64 {
+        if w.is_empty() {
+            return 0.0;
+        }
+        let mut w = w.to_vec();
+        w.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        w[w.len() / 2]
+    };
+    let op_json = format!(
+        ",\"op_open_pools\":{},\"op_open_net_sol\":{:.4},\"op_open_median\":{:.4},\"op_open_pools_over_1\":{},\"op_grad_pools\":{},\"op_grad_net_sol\":{:.4},\"op_grad_median\":{:.4}",
+        op_open.len(),
+        op_open.iter().sum::<f64>(),
+        med(&op_open),
+        op_open.iter().filter(|x| **x >= 1.0).count(),
+        op_grad.len(),
+        op_grad.iter().sum::<f64>(),
+        med(&op_grad),
+    );
     let mut v = fs.external_net_per_pool.clone();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let q = |p: f64| if v.is_empty() { 0.0 } else { v[((v.len() - 1) as f64 * p).round() as usize] };
     format!(
-        ",\"research\":{{\"active_pools\":{},\"external_wallets\":{},\"external_net_sol\":{:.4},\"external_net_median\":{:.4},\"external_net_p90\":{:.4},\"external_net_max\":{:.4},\"pools_external_net_over_1\":{},\"pools_external_net_over_5\":{},\"median_linked_share\":{},\"farm_wallets\":{},\"master_wallets\":{},\"total_volume_sol\":{:.2}}}",
+        ",\"research\":{{\"active_pools\":{},\"external_wallets\":{},\"external_net_sol\":{:.4},\"external_net_median\":{:.4},\"external_net_p90\":{:.4},\"external_net_max\":{:.4},\"pools_external_net_over_1\":{},\"pools_external_net_over_5\":{},\"median_linked_share\":{},\"farm_wallets\":{},\"master_wallets\":{},\"total_volume_sol\":{:.2}{}}}",
         v.len(),
         fs.external_wallets,
         v.iter().sum::<f64>(),
@@ -704,6 +726,7 @@ fn research_json(r: &RiskRow) -> String {
         fs.farm_wallets,
         fs.master_wallets,
         fs.total_volume_lamports as f64 / 1e9,
+        op_json,
     )
 }
 

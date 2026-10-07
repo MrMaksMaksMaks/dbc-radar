@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
-"""Сколько SOL внешние кошельки оставляют на кривой — по вердиктам DBC Radar. Только для исследований.
+"""Сколько оператор забирает у остальных на кривой — по вердиктам DBC Radar. Только для исследований.
 
 Запуск из корня репозитория:
     replay/target/release/dbc-replay dbc.sqlite risk --json --research > /tmp/risk_research.json
     python3 tools/external_losses.py [--min-pools=3] [--top=15]
 
-«Внешние» — кошельки, не связанные с оператором конфига (не создатель, не раздача, не ферма,
-не мастер-кошелёк); сюда входят и общие боты. «Оставили на кривой» — их покупки минус продажи
-в активных пулах конфига: верхняя оценка потерь (у них остаются токены, которые могут чего-то
-стоить, особенно после миграции). Отрицательное значение — внешние вывели больше, чем внесли.
+Метрика — «изъятие оператора»: сколько SOL связанные кошельки (создатель, раздача, ферма,
+мастер-кошельки) вывели с кривой сверх вложенного. В невыпустившемся пуле деньги никуда не уходят,
+поэтому плюс оператора — это ровно то, что заплатили остальные участники (внешние и боты).
+У выпустившихся пулов часть SOL ушла в ликвидность DAMM v2, и оператор возвращает её выводом
+ликвидности, — там на кривой он обычно в минусе, это не потеря внешних.
 
-Главный вопрос: есть ли GREEN и AMBER-конфиги, где внешние систематически теряют деньги, —
-то есть опасные пулы, которые вердикт не выделяет.
+Ограничения: только конфиги в SOL; мастер-кошельки с прокси распознаются лишь по свопам,
+записанным после 7 октября 2026 (в старых данных такой мастер считается внешним).
+
+Главный вопрос: есть ли GREEN и AMBER-конфиги, где оператор систематически забирает деньги
+остальных на кривой, — опасные пулы, которые вердикт не выделяет.
 """
 import json
 import sys
+
+WSOL = "So11111111111111111111111111111111111111112"
 
 
 def opt(name, default):
@@ -26,47 +32,51 @@ def opt(name, default):
 
 MIN_POOLS = int(opt("min-pools", "3"))
 TOP = int(opt("top", "15"))
-rows = [r for r in json.load(open("/tmp/risk_research.json")) if r.get("research")]
+allrows = [r for r in json.load(open("/tmp/risk_research.json")) if r.get("research")]
+rows = [r for r in allrows if r.get("quote_mint") == WSOL]
 VERDICTS = ["RED", "RED-LINK", "AMBER", "SELF-GRAD", "GREEN"]
 
-print(f"configs with research data: {len(rows)}; per-config figures below use configs with >= {MIN_POOLS} active pools\n")
-print(f"{'verdict':<10} {'configs':>7} {'pools':>6} | {'ext net SOL':>11} {'per pool':>8} | {'cfg median/pool >= 0.5':>22} "
-      f"{'>= 2':>5} | {'pools >= 1 SOL':>14} {'>= 5 SOL':>8}")
+print(f"configs with research data: {len(allrows)}, of them quoted in SOL: {len(rows)} (others excluded)\n")
+print("operator net on the curve, NOT graduated pools (positive = operator took other participants' SOL):")
+print(f"{'verdict':<10} {'configs':>7} {'open pools':>10} | {'op net SOL':>10} {'per pool':>8} | "
+      f"{'cfg median >= 0.5':>17} {'>= 1':>5} | {'pools >= 1 SOL':>14} | {'graduated: op median':>20}")
 for v in VERDICTS:
     g = [r for r in rows if r["verdict"] == v]
     if not g:
         continue
-    pools = sum(r["research"]["active_pools"] for r in g)
-    net = sum(r["research"]["external_net_sol"] for r in g)
-    big = [r for r in g if r["research"]["active_pools"] >= MIN_POOLS]
-    m05 = sum(1 for r in big if r["research"]["external_net_median"] >= 0.5)
-    m2 = sum(1 for r in big if r["research"]["external_net_median"] >= 2.0)
-    p1 = sum(r["research"]["pools_external_net_over_1"] for r in g)
-    p5 = sum(r["research"]["pools_external_net_over_5"] for r in g)
-    print(f"{v:<10} {len(g):>7} {pools:>6} | {net:>11.1f} {net / max(pools, 1):>8.3f} | {m05:>14} of {len(big):<5} {m2:>5} | "
-          f"{p1:>14} {p5:>8}")
+    x = [r["research"] for r in g]
+    pools = sum(e["op_open_pools"] for e in x)
+    net = sum(e["op_open_net_sol"] for e in x)
+    big = [e for e in x if e["op_open_pools"] >= MIN_POOLS]
+    m05 = sum(1 for e in big if e["op_open_median"] >= 0.5)
+    m1 = sum(1 for e in big if e["op_open_median"] >= 1.0)
+    p1 = sum(e["op_open_pools_over_1"] for e in x)
+    gr = sorted(e["op_grad_median"] for e in x if e["op_grad_pools"] > 0)
+    grm = f"{gr[len(gr) // 2]:+.2f}" if gr else "-"
+    print(f"{v:<10} {len(g):>7} {pools:>10} | {net:>+10.1f} {net / max(pools, 1):>+8.3f} | "
+          f"{m05:>9} of {len(big):<5} {m1:>5} | {p1:>14} | {grm:>20}")
 
 
 def show(title, items):
     print(f"\n{title}")
-    print(f"  {'config':<10} {'verdict':<9} {'pools':>5} {'ext net':>8} {'median':>7} {'p90':>6} {'max':>6} {'ext wal':>7} "
-          f"{'linked':>6} {'farm':>4} | main flags")
+    print(f"  {'config':<10} {'verdict':<9} {'open':>4} {'op net':>7} {'median':>7} {'>=1':>4} | {'ext wal':>7} "
+          f"{'linked':>6} {'farm':>4} {'mast':>4} | main flags")
     for r in items:
         x = r["research"]
-        flags = "; ".join(f["text"][:48] for f in (r["capability_flags"] + r["evidence_flags"]) if f["points"] > 0)[:110]
+        flags = "; ".join(f["text"][:46] for f in (r["capability_flags"] + r["evidence_flags"]) if f["points"] > 0)[:110]
         ls = f"{x['median_linked_share']:.0%}" if x["median_linked_share"] is not None else "-"
-        print(f"  {r['config'][:8]:<10} {r['verdict']:<9} {x['active_pools']:>5} {x['external_net_sol']:>8.1f} "
-              f"{x['external_net_median']:>7.2f} {x['external_net_p90']:>6.2f} {x['external_net_max']:>6.1f} "
-              f"{x['external_wallets']:>7} {ls:>6} {x['farm_wallets']:>4} | {flags or '-'}")
+        print(f"  {r['config'][:8]:<10} {r['verdict']:<9} {x['op_open_pools']:>4} {x['op_open_net_sol']:>+7.1f} "
+              f"{x['op_open_median']:>+7.2f} {x['op_open_pools_over_1']:>4} | {x['external_wallets']:>7} {ls:>6} "
+              f"{x['farm_wallets']:>4} {x['master_wallets']:>4} | {flags or '-'}")
 
 
-# кандидаты на пропуск: внешние стабильно оставляют деньги, а вердикт не RED
-cand = [r for r in rows if r["verdict"] in ("GREEN", "AMBER", "SELF-GRAD") and r["research"]["active_pools"] >= MIN_POOLS]
-show(f"GREEN / AMBER / SELF-GRAD where externals leave the most SOL per pool (median, >= {MIN_POOLS} active pools):",
-     sorted(cand, key=lambda r: -r["research"]["external_net_median"])[:TOP])
-show("GREEN / AMBER / SELF-GRAD where externals leave the most SOL in total:",
-     sorted(cand, key=lambda r: -r["research"]["external_net_sol"])[:TOP])
-show("RED / RED-LINK for comparison (most SOL left by externals in total):",
-     sorted([r for r in rows if r["verdict"] in ("RED", "RED-LINK")], key=lambda r: -r["research"]["external_net_sol"])[:8])
-print("\nnotes: ext net = externals' buys minus sells on the curve, an upper bound of their losses (they keep tokens);"
-      "\n       externals include generic bots; per-config median is over active pools (>= 3 non-creator trades).")
+cand = [r for r in rows if r["verdict"] in ("GREEN", "AMBER", "SELF-GRAD") and r["research"]["op_open_pools"] >= MIN_POOLS]
+show(f"GREEN / AMBER / SELF-GRAD where the operator takes the most per open pool (median, >= {MIN_POOLS} open pools):",
+     sorted(cand, key=lambda r: -r["research"]["op_open_median"])[:TOP])
+show("GREEN / AMBER / SELF-GRAD where the operator takes the most in total on open pools:",
+     sorted([r for r in rows if r["verdict"] in ("GREEN", "AMBER", "SELF-GRAD")], key=lambda r: -r["research"]["op_open_net_sol"])[:TOP])
+show("RED / RED-LINK for comparison:",
+     sorted([r for r in rows if r["verdict"] in ("RED", "RED-LINK")], key=lambda r: -r["research"]["op_open_net_sol"])[:8])
+print("\nnotes: op net = what creator, fan-out, farm and master wallets withdrew from the curve beyond what they put in;"
+      "\n       on a pool that has not graduated this equals what everyone else paid in (externals and bots);"
+      "\n       master wallets behind proxies are recognised only in swaps recorded after Oct 7, 2026.")

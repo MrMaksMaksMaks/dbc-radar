@@ -84,6 +84,10 @@ pub struct FarmStats {
     /// по активным пулам: SOL, оставленные внешними кошельками на кривой (покупки − продажи;
     /// положительное — внешние внесли больше, чем вывели). Только для исследований (--research).
     pub external_net_per_pool: Vec<f64>,
+    /// по активным пулам: (SOL, которые связанные кошельки — создатель, раздача, ферма, мастера —
+    /// вывели с кривой сверх вложенного; пул выпустился). Положительное — оператор забрал чужие
+    /// деньги на кривой. Только для исследований (--research).
+    pub operator_net_per_pool: Vec<(f64, bool)>,
 }
 
 impl FarmStats {
@@ -392,6 +396,7 @@ pub fn analyze_loaded(data: &ScopeData, metrics: &[String], idx: &WalletIndex, m
         all_masters.extend(masters.iter().copied());
         let (mut total, mut linked, mut proxied) = (0u64, 0u64, 0u64);
         let (mut ext_buy, mut ext_sell) = (0u64, 0u64);
+        let (mut op_buy, mut op_sell) = (0u64, 0u64);
         let non_creator = p.swaps.iter().filter(|s| s.wallet != p.creator).count();
         for s in &p.swaps {
             let v = sol_volume(s);
@@ -405,6 +410,11 @@ pub fn analyze_loaded(data: &ScopeData, metrics: &[String], idx: &WalletIndex, m
                 || payer == p.creator || masters.contains(payer) || farm.contains(payer)
             {
                 linked += v;
+                if s.buy {
+                    op_buy += s.input;
+                } else {
+                    op_sell += s.output;
+                }
             } else {
                 external.insert(w);
                 if s.buy {
@@ -423,6 +433,7 @@ pub fn analyze_loaded(data: &ScopeData, metrics: &[String], idx: &WalletIndex, m
             shares.push(linked as f64 / total as f64);
             proxied_shares.push(proxied as f64 / total as f64);
             out.external_net_per_pool.push((ext_buy as f64 - ext_sell as f64) / 1e9);
+            out.operator_net_per_pool.push(((op_sell as f64 - op_buy as f64) / 1e9, p.graduated_time.is_some()));
         }
     }
     out.master_wallets = all_masters.len();
@@ -538,6 +549,8 @@ mod tests {
         // внешний кошелёк EXTk купил на 0,01 SOL в каждом из 3 пулов и ничего не продал
         assert_eq!(m.external_net_per_pool.len(), 3);
         assert!(m.external_net_per_pool.iter().all(|x| (x - 0.01).abs() < 1e-9));
+        // мастер купил на 5 SOL в каждом пуле и ничего не продал: оператор вложил, а не забрал
+        assert!(m.operator_net_per_pool.iter().all(|(x, grad)| (x + 5.0).abs() < 1e-9 && !grad));
         let r = analyze_config(&conn, "R", &idx, 0).unwrap();
         assert_eq!(r.master_wallets, 0, "a relayer signing for many users is not a master");
     }
