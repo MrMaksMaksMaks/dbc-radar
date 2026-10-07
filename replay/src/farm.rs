@@ -85,9 +85,9 @@ pub struct FarmStats {
     /// положительное — внешние внесли больше, чем вывели). Только для исследований (--research).
     pub external_net_per_pool: Vec<f64>,
     /// по активным пулам: (SOL, которые связанные кошельки — создатель, раздача, ферма, мастера —
-    /// вывели с кривой сверх вложенного; пул выпустился). Положительное — оператор забрал чужие
+    /// вывели с кривой сверх вложенного; пул выпустился; время создания). Положительное — оператор забрал чужие
     /// деньги на кривой. Только для исследований (--research).
-    pub operator_net_per_pool: Vec<(f64, bool)>,
+    pub operator_net_per_pool: Vec<(f64, bool, i64)>,
 }
 
 impl FarmStats {
@@ -433,7 +433,11 @@ pub fn analyze_loaded(data: &ScopeData, metrics: &[String], idx: &WalletIndex, m
             shares.push(linked as f64 / total as f64);
             proxied_shares.push(proxied as f64 / total as f64);
             out.external_net_per_pool.push((ext_buy as f64 - ext_sell as f64) / 1e9);
-            out.operator_net_per_pool.push(((op_sell as f64 - op_buy as f64) / 1e9, p.graduated_time.is_some()));
+            out.operator_net_per_pool.push((
+                (op_sell as f64 - op_buy as f64) / 1e9,
+                p.graduated_time.is_some(),
+                p.created_time.unwrap_or(0),
+            ));
         }
     }
     out.master_wallets = all_masters.len();
@@ -550,7 +554,7 @@ mod tests {
         assert_eq!(m.external_net_per_pool.len(), 3);
         assert!(m.external_net_per_pool.iter().all(|x| (x - 0.01).abs() < 1e-9));
         // мастер купил на 5 SOL в каждом пуле и ничего не продал: оператор вложил, а не забрал
-        assert!(m.operator_net_per_pool.iter().all(|(x, grad)| (x + 5.0).abs() < 1e-9 && !grad));
+        assert!(m.operator_net_per_pool.iter().all(|(x, grad, _)| (x + 5.0).abs() < 1e-9 && !grad));
         let r = analyze_config(&conn, "R", &idx, 0).unwrap();
         assert_eq!(r.master_wallets, 0, "a relayer signing for many users is not a master");
     }

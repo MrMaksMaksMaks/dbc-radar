@@ -3,6 +3,8 @@
 
 Запуск из корня репозитория:
     replay/target/release/dbc-replay dbc.sqlite risk --json --research > /tmp/risk_research.json
+    # только пулы, созданные после того, как сборщик начал записывать фактического плательщика:
+    replay/target/release/dbc-replay dbc.sqlite risk --json --research --research-since <unix> > /tmp/risk_research.json
     python3 tools/external_losses.py [--min-pools=3] [--top=15]
 
 Метрика — «изъятие оператора»: сколько SOL связанные кошельки (создатель, раздача, ферма,

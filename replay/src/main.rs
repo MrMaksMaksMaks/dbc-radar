@@ -48,7 +48,7 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args> {
-    let usage = "usage: dbc-replay <dbc.sqlite> <pool prefix> [--cf ...]\n       dbc-replay <dbc.sqlite> risk [config prefix] [--json [--research]] [--limit N]\n       dbc-replay <dbc.sqlite> clusters [config prefix]\n       dbc-replay <dbc.sqlite> templates\n       dbc-replay <dbc.sqlite> impact [--since-hours N] [--sol-usd 122]";
+    let usage = "usage: dbc-replay <dbc.sqlite> <pool prefix> [--cf ...]\n       dbc-replay <dbc.sqlite> risk [config prefix] [--json [--research [--research-since UNIX]]] [--limit N]\n       dbc-replay <dbc.sqlite> clusters [config prefix]\n       dbc-replay <dbc.sqlite> templates\n       dbc-replay <dbc.sqlite> impact [--since-hours N] [--sol-usd 122]";
     let mut flags = HashMap::new();
     let mut switches = Vec::new();
     let mut positional = Vec::new();
@@ -685,12 +685,15 @@ fn sort_rows(rows: &mut [&RiskRow]) {
 }
 
 /// Поля для исследований: что внешние кошельки оставили на кривой, по активным пулам конфига.
-fn research_json(r: &RiskRow) -> String {
+fn research_json(r: &RiskRow, since: i64) -> String {
     let Some(fs) = r.beh.farm.as_ref() else { return ",\"research\":null".to_string() };
     // оператор: что связанные кошельки вывели с кривой сверх вложенного, отдельно по
     // невыпустившимся пулам (там это чистое изъятие у остальных) и по выпустившимся
-    let op_open: Vec<f64> = fs.operator_net_per_pool.iter().filter(|x| !x.1).map(|x| x.0).collect();
-    let op_grad: Vec<f64> = fs.operator_net_per_pool.iter().filter(|x| x.1).map(|x| x.0).collect();
+    // --research-since: только пулы, созданные не раньше этого времени (например, после того как
+    // сборщик начал записывать фактического плательщика и мастер-кошельки стали распознаваться)
+    let recent = |x: &&(f64, bool, i64)| x.2 >= since;
+    let op_open: Vec<f64> = fs.operator_net_per_pool.iter().filter(recent).filter(|x| !x.1).map(|x| x.0).collect();
+    let op_grad: Vec<f64> = fs.operator_net_per_pool.iter().filter(recent).filter(|x| x.1).map(|x| x.0).collect();
     let med = |w: &[f64]| -> f64 {
         if w.is_empty() {
             return 0.0;
@@ -758,6 +761,7 @@ fn run_risk(conn: &rusqlite::Connection, args: &Args) -> Result<()> {
         // --research: поля для исследований (деньги внешних по пулам); бот их не запрашивает,
         // поэтому в карточки и API они не попадают
         let research = args.has("--research");
+        let research_since: i64 = args.flags.get("--research-since").and_then(|v| v.parse().ok()).unwrap_or(0);
         let opt = |v: Option<f64>| v.map(|x| format!("{x:.4}")).unwrap_or_else(|| "null".into());
         let items: Vec<String> = rows
             .iter()
@@ -794,7 +798,7 @@ fn run_risk(conn: &rusqlite::Connection, args: &Args) -> Result<()> {
                     opt(r.beh.median_outside_sol),
                     flags_json(&r.rep.capability_flags),
                     flags_json(&r.rep.evidence_flags),
-                    if research { research_json(r) } else { String::new() },
+                    if research { research_json(r, research_since) } else { String::new() },
                 )
             })
             .collect();
