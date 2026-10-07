@@ -520,10 +520,24 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
     }
 
     // Перенос риска — только по ПРЯМЫМ связям конфига с RED-конфигами (без цепочек через кластер):
-    //   * общий создатель пулов, общий адрес оператора (не платформы) — RED-LINK;
+    //   * общие создатели пулов, на которых приходится >= 30% пулов конфига, общий адрес оператора
+    //     (синтетика у большинства его конфигов) — RED-LINK; меньшая доля общих создателей
+    //     (например, конфиг лаунчпада, где пара пользователей запускала и на RED-конфиге) — инфо;
     //   * только общие сателлиты (>= MIN_SHARED_SATELLITES) — RED-LINK, если сам конфиг рискованный
     //     (capability >= 50), иначе информационный флаг;
     //   * только общий адрес платформы — информационный флаг.
+    // пулов у каждого создателя в каждом конфиге и всего пулов конфига: вес связи через общих создателей
+    let mut creator_pools: HashMap<(String, String), usize> = HashMap::new();
+    let mut config_pools: HashMap<String, usize> = HashMap::new();
+    {
+        let mut st = conn.prepare("SELECT config, creator, COUNT(*) FROM pools GROUP BY config, creator")?;
+        let rows_cp = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? as usize)))?;
+        for row in rows_cp {
+            let (cfg, creator, n) = row?;
+            *config_pools.entry(cfg.clone()).or_default() += n;
+            creator_pools.insert((cfg, creator), n);
+        }
+    }
     let mut red_templates: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for (i, r) in rows.iter().enumerate() {
         if red[i] {
@@ -541,13 +555,27 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
             let mut strong_kinds: BTreeSet<cluster::LinkKind> = BTreeSet::new();
             let mut platform_kinds: BTreeSet<cluster::LinkKind> = BTreeSet::new();
             let (mut strong_n, mut sat_n, mut platform_n) = (0usize, 0usize, 0usize);
+            let (mut creator_weak_n, mut creator_weak_share) = (0usize, 0f64);
+            let my_total = config_pools.get(&mi.config).copied().unwrap_or(0).max(1);
             for &k in &reds {
                 let ki = &infos[k];
                 let mut strong = false;
                 let mut platform = false;
-                if mi.creators.iter().any(|a| ki.creators.contains(a)) {
-                    strong_kinds.insert(cluster::LinkKind::Creator);
-                    strong = true;
+                let shared_pools: usize = mi
+                    .creators
+                    .iter()
+                    .filter(|a| ki.creators.contains(a))
+                    .map(|a| creator_pools.get(&(mi.config.clone(), a.clone())).copied().unwrap_or(0))
+                    .sum();
+                if shared_pools > 0 {
+                    let share = shared_pools as f64 / my_total as f64;
+                    if share >= 0.3 {
+                        strong_kinds.insert(cluster::LinkKind::Creator);
+                        strong = true;
+                    } else {
+                        creator_weak_n += 1;
+                        creator_weak_share = creator_weak_share.max(share);
+                    }
                 }
                 for (kind, a, b) in [
                     (cluster::LinkKind::FeeClaimer, &mi.fee_claimer, &ki.fee_claimer),
@@ -603,6 +631,15 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
                         "shares {}+ selling wallets with {} config(s) where trading is dominated by creator-linked wallets; not enough to flag this config on its own",
                         cluster::MIN_SHARED_SATELLITES,
                         sat_n
+                    ),
+                });
+            } else if creator_weak_n > 0 {
+                r.rep.evidence_flags.push(risk::Flag {
+                    points: 0,
+                    text: format!(
+                        "{:.0}% of its pools come from creators who also launched on {} config(s) where trading is dominated by creator-linked wallets; too small a share to treat as a link",
+                        creator_weak_share * 100.0,
+                        creator_weak_n
                     ),
                 });
             } else if platform_n > 0 {
