@@ -66,8 +66,9 @@ impl App {
         for (idx, ev) in &p.events {
             match ev {
                 DbcEvent::Swap2(s) if self.db.is_tracked(&s.pool)? => {
+                    let owners = p.trade_owners(s.trade_direction == 1);
                     self.db
-                        .insert_swap(sig, *idx, p.slot, p.block_time, &p.fee_payer, s)?;
+                        .insert_swap(sig, *idx, p.slot, p.block_time, &p.fee_payer, owners, s)?;
                 }
                 DbcEvent::CurveComplete(c) if self.db.is_tracked(&c.pool)? => {
                     tracing::info!(pool = %c.pool, "curve complete");

@@ -18,6 +18,10 @@ use anyhow::Result;
 use rusqlite::{params, Connection};
 use std::collections::{HashMap, HashSet};
 
+/// Мастер-кошелёк: платил или получал SOL за сделки не менее стольких разных подписантов в пуле...
+const MASTER_MIN_SIGNERS: usize = 3;
+/// ...и не менее стольких сделок.
+const MASTER_MIN_SWAPS: usize = 5;
 /// Покупка в эти первые слоты после создания пула считается «ранней» (~10 с).
 pub const EARLY_SLOTS: i64 = 25;
 /// Доля пулов конфига, в которых должен торговать кошелёк фермы.
@@ -73,6 +77,10 @@ pub struct FarmStats {
     pub external_sell_lamports: u64,
     pub total_volume_lamports: u64,
     pub linked_volume_lamports: u64,
+    /// мастер-кошельки: платили или получали SOL за сделки не менее MASTER_MIN_SIGNERS чужих подписантов
+    pub master_wallets: usize,
+    /// медиана по пулам: доля объёма, за которую платил не подписант (мастер через прокси)
+    pub median_proxied_share: Option<f64>,
 }
 
 impl FarmStats {
@@ -84,6 +92,8 @@ impl FarmStats {
 
 struct Swap {
     wallet: String,
+    /// чьи SOL в сделке (sol_owner из коллектора); для старых записей — подписант
+    payer: String,
     buy: bool,
     input: u64,
     output: u64,
@@ -186,16 +196,22 @@ pub fn load_scope(conn: &Connection, scope: &[String]) -> Result<ScopeData> {
         heads.extend(rows);
     }
 
-    let mut sw = conn.prepare_cached(
-        "SELECT fee_payer, trade_direction, included_fee_input_amount, output_amount, slot
-         FROM swaps WHERE pool = ?1 ORDER BY slot, event_index",
-    )?;
+    // колонка sol_owner есть в базах коллектора новее этого изменения
+    let has_owner = conn.prepare("SELECT sol_owner FROM swaps LIMIT 0").is_ok();
+    let mut sw = conn.prepare_cached(if has_owner {
+        "SELECT fee_payer, trade_direction, included_fee_input_amount, output_amount, slot, COALESCE(sol_owner, fee_payer)
+         FROM swaps WHERE pool = ?1 ORDER BY slot, event_index"
+    } else {
+        "SELECT fee_payer, trade_direction, included_fee_input_amount, output_amount, slot, fee_payer
+         FROM swaps WHERE pool = ?1 ORDER BY slot, event_index"
+    })?;
     let mut pools: Vec<PoolData> = Vec::new();
     for (pool, creator, created_time, created_slot, graduated_time, config) in heads {
         let swaps: Vec<Swap> = sw
             .query_map(params![pool], |r| {
                 Ok(Swap {
                     wallet: r.get(0)?,
+                    payer: r.get(5)?,
                     buy: r.get::<_, i64>(1)? == 1,
                     input: r.get::<_, i64>(2)? as u64,
                     output: r.get::<_, i64>(3)? as u64,
@@ -342,6 +358,8 @@ pub fn analyze_loaded(data: &ScopeData, metrics: &[String], idx: &WalletIndex, m
     let mut mig = Vec::new();
     let mut shares = Vec::new();
     let mut fanouts = Vec::new();
+    let mut proxied_shares = Vec::new();
+    let mut all_masters: HashSet<&str> = HashSet::new();
     let mut external: HashSet<&str> = HashSet::new();
     for (p, fanout) in pools.iter().zip(&fanout_per_pool) {
         if !metric_set.contains(p.config.as_str()) || p.created_time.unwrap_or(i64::MAX) < metrics_since {
@@ -353,13 +371,35 @@ pub fn analyze_loaded(data: &ScopeData, metrics: &[String], idx: &WalletIndex, m
             mig.push((g - c).max(0) as f64);
         }
         fanouts.push(fanout.len() as f64);
-        let (mut total, mut linked) = (0u64, 0u64);
+        // мастер-кошельки пула: платят или получают SOL за сделки нескольких чужих подписантов
+        // (один релейер, подписывающий за многих, — обратный случай и сюда не попадает)
+        let mut signers_of: HashMap<&str, (HashSet<&str>, usize)> = HashMap::new();
+        for s in &p.swaps {
+            if s.payer != s.wallet {
+                let e = signers_of.entry(s.payer.as_str()).or_default();
+                e.0.insert(s.wallet.as_str());
+                e.1 += 1;
+            }
+        }
+        let masters: HashSet<&str> = signers_of
+            .iter()
+            .filter(|(_, (signers, n))| signers.len() >= MASTER_MIN_SIGNERS && *n >= MASTER_MIN_SWAPS)
+            .map(|(m, _)| *m)
+            .collect();
+        all_masters.extend(masters.iter().copied());
+        let (mut total, mut linked, mut proxied) = (0u64, 0u64, 0u64);
         let non_creator = p.swaps.iter().filter(|s| s.wallet != p.creator).count();
         for s in &p.swaps {
             let v = sol_volume(s);
             total += v;
             let w = s.wallet.as_str();
-            if w == p.creator || fanout.contains(w) || farm.contains(w) {
+            let payer = s.payer.as_str();
+            if masters.contains(payer) {
+                proxied += v;
+            }
+            if w == p.creator || fanout.contains(w) || farm.contains(w)
+                || payer == p.creator || masters.contains(payer) || farm.contains(payer)
+            {
                 linked += v;
             } else {
                 external.insert(w);
@@ -375,8 +415,11 @@ pub fn analyze_loaded(data: &ScopeData, metrics: &[String], idx: &WalletIndex, m
         if total > 0 && non_creator >= MIN_ACTIVE_SWAPS {
             out.active_pools += 1;
             shares.push(linked as f64 / total as f64);
+            proxied_shares.push(proxied as f64 / total as f64);
         }
     }
+    out.master_wallets = all_masters.len();
+    out.median_proxied_share = if proxied_shares.is_empty() { None } else { median(proxied_shares) };
     out.external_wallets = external.len();
     out.median_migration_secs = median(mig);
     out.median_linked_share = if shares.len() >= MIN_POOLS.min(out.pools.max(1)) { median(shares) } else { None };
@@ -451,6 +494,44 @@ mod tests {
     /// Ферма оператора разнесена по двум конфигам: по одному конфигу кошельки неспецифичны
     /// (половина их активности в другом конфиге), по кластеру — специфичны.
     /// Пулы мгновенной graduation (только покупка создателя) в долю связанного объёма не входят.
+    #[test]
+    fn master_behind_fresh_proxies_is_linked_but_relayer_is_not() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pools(pool, config, creator, created_time, created_slot, tracked);
+             CREATE TABLE swaps(pool, fee_payer, trade_direction, included_fee_input_amount, output_amount, slot, event_index, sol_owner);
+             CREATE TABLE curve_complete(pool, block_time);",
+        )
+        .unwrap();
+        let sw = |pool: &str, signer: &str, payer: &str, i: i64| {
+            conn.execute("INSERT INTO swaps VALUES(?1,?2,1,?3,1,140,0,?4)", params![pool, signer, i, payer]).unwrap();
+        };
+        // конфиг M: в каждом из 3 пулов мастер MASTER платит за 5 сделок 4 свежих прокси
+        for k in 0..3 {
+            let p = format!("M{k}");
+            conn.execute("INSERT INTO pools VALUES(?1,'M','CM',1000,100,1)", params![p]).unwrap();
+            for j in 0..5 {
+                sw(&p, &format!("PROXY{k}_{}", j % 4), "MASTER", 1_000_000_000);
+            }
+            sw(&p, &format!("EXT{k}"), &format!("EXT{k}"), 10_000_000);
+        }
+        // конфиг R: релейер RELAY подписывает за 5 разных пользователей, каждый платит сам
+        for k in 0..3 {
+            let p = format!("R{k}");
+            conn.execute("INSERT INTO pools VALUES(?1,'R','CR',1000,100,1)", params![p]).unwrap();
+            for j in 0..5 {
+                sw(&p, "RELAY", &format!("USER{k}_{j}"), 1_000_000_000);
+            }
+        }
+        let idx = wallet_index(&conn).unwrap();
+        let m = analyze_config(&conn, "M", &idx, 0).unwrap();
+        assert_eq!(m.master_wallets, 1);
+        assert!(m.median_linked_share.unwrap() > 0.99, "master volume is linked: {:?}", m.median_linked_share);
+        assert!(m.median_proxied_share.unwrap() > 0.99);
+        let r = analyze_config(&conn, "R", &idx, 0).unwrap();
+        assert_eq!(r.master_wallets, 0, "a relayer signing for many users is not a master");
+    }
+
     #[test]
     fn decoy_dust_does_not_hide_a_farm_wallet() {
         let conn = Connection::open_in_memory().unwrap();

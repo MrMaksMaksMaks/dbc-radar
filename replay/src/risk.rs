@@ -366,14 +366,30 @@ pub fn score(f: &ConfigFacts, b: &Behavior) -> Report {
     if let Some(fs) = &b.farm {
         if let Some(sh) = fs.median_linked_share {
             if sh >= 0.8 {
+                let masters = if fs.master_wallets > 0 {
+                    format!(" and {} wallet(s) trading through proxy signers", fs.master_wallets)
+                } else {
+                    String::new()
+                };
                 add(&mut ev, 40, format!(
-                    "{:.0}% of trading volume (median per pool) comes from the creator and {} recurring linked wallets",
+                    "{:.0}% of trading volume (median per pool) comes from the creator, {} recurring linked wallets{}",
                     sh * 100.0,
-                    fs.farm_wallets
+                    fs.farm_wallets,
+                    masters
                 ));
             } else if sh >= 0.5 {
                 add(&mut ev, 20, format!("{:.0}% of trading volume (median per pool) comes from the creator and linked wallets", sh * 100.0));
             }
+        }
+        if let Some(px) = fs.median_proxied_share.filter(|x| *x >= 0.3) {
+            add(
+                &mut ev,
+                0,
+                format!(
+                    "{:.0}% of curve volume (median per pool) is paid by a wallet other than the one signing the trade: one wallet trades through several proxy wallets",
+                    px * 100.0
+                ),
+            );
         }
         if fs.volume_only_wallets >= 5 {
             add(

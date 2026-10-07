@@ -59,6 +59,8 @@ CREATE TABLE IF NOT EXISTS swaps (
     migration_threshold       INTEGER NOT NULL,
     event_timestamp           INTEGER NOT NULL,
     transfer_hook             INTEGER NOT NULL,
+    sol_owner                 TEXT,              -- чьи SOL: плательщик при покупке, получатель при продаже
+    token_owner               TEXT,              -- кто получил (покупка) или отдал (продажа) токены
     PRIMARY KEY (signature, event_index)
 );
 CREATE INDEX IF NOT EXISTS swaps_pool_slot ON swaps(pool, slot);
@@ -110,6 +112,15 @@ impl Db {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
+        // миграция базы, созданной до появления колонок фактических сторон сделки
+        for col in ["sol_owner", "token_owner"] {
+            let exists = conn
+                .prepare("SELECT 1 FROM pragma_table_info('swaps') WHERE name = ?1")?
+                .exists([col])?;
+            if !exists {
+                conn.execute_batch(&format!("ALTER TABLE swaps ADD COLUMN {col} TEXT"))?;
+            }
+        }
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -142,18 +153,24 @@ impl Db {
         slot: u64,
         block_time: Option<i64>,
         fee_payer: &str,
+        owners: (Option<String>, Option<String>),
         s: &Swap2,
     ) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT OR IGNORE INTO swaps VALUES
-             (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
+            "INSERT OR IGNORE INTO swaps
+             (signature, event_index, pool, config, slot, block_time, fee_payer, trade_direction,
+              has_referral, swap_mode, amount_0, amount_1, included_fee_input_amount,
+              excluded_fee_input_amount, amount_left, output_amount, next_sqrt_price, trading_fee,
+              protocol_fee, referral_fee, quote_reserve_amount, migration_threshold, event_timestamp,
+              transfer_hook, sol_owner, token_owner)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26)",
             params![
                 sig, event_index, s.pool, s.config, i(slot), block_time, fee_payer,
                 s.trade_direction, s.has_referral, s.swap_mode, i(s.amount_0), i(s.amount_1),
                 i(s.included_fee_input_amount), i(s.excluded_fee_input_amount), i(s.amount_left),
                 i(s.output_amount), s.next_sqrt_price.to_string(), i(s.trading_fee),
                 i(s.protocol_fee), i(s.referral_fee), i(s.quote_reserve_amount),
-                i(s.migration_threshold), i(s.current_timestamp), s.transfer_hook
+                i(s.migration_threshold), i(s.current_timestamp), s.transfer_hook, owners.0, owners.1
             ],
         )?;
         Ok(())
