@@ -446,7 +446,13 @@ pub fn score(f: &ConfigFacts, b: &Behavior) -> Report {
     }
     let evidence = if b.tracked > 0 { Some(ev.iter().map(|f| f.points).sum::<u32>().min(100)) } else { None };
 
-    let verdict = if evidence.unwrap_or(0) >= 50 {
+    // RED требует сильного торгового доказательства: не меньше 80% объёма у связанных кошельков
+    // или массовая раздача (10+ продавцов без покупок на пул). Сумма слабых признаков (около
+    // половины связанного объёма, один создатель, одинаковая первая покупка) RED не даёт:
+    // вердикт тогда определяется конфигом, а признаки остаются видны в отчёте.
+    let strong_trading = b.median_outside_wallets.unwrap_or(0.0) >= 10.0
+        || b.farm.as_ref().and_then(|fs| fs.median_linked_share).unwrap_or(0.0) >= 0.8;
+    let verdict = if evidence.unwrap_or(0) >= 50 && strong_trading {
         Verdict::Synthetic
     } else if self_grad {
         Verdict::SelfGraduation
@@ -543,6 +549,25 @@ mod tests {
         }
         assert_eq!(r.verdict, Verdict::Synthetic);
         assert_eq!(r.capability, 60);
+
+        // Слабые признаки (одинаковая первая покупка, один создатель) без сильного торгового
+        // доказательства RED не дают, даже если баллов набралось 50+.
+        let weak = Behavior {
+            pools: 7,
+            creators: 1,
+            tracked: 3,
+            median_outside_wallets: Some(0.0),
+            farm: Some(crate::farm::FarmStats {
+                median_linked_share: Some(0.55),
+                dev_buy_mode: Some((3.0, 1.0)),
+                first_buyers: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let rw = score(&f, &weak);
+        assert!(rw.evidence.unwrap() >= 50, "weak signals add up: {:?}", rw.evidence);
+        assert_eq!(rw.verdict, Verdict::RugCapable, "weak signals do not make RED; the risky config gives AMBER");
 
         // Тот же конфиг без наблюдений — только возможность.
         assert_eq!(score(&f, &Behavior { pools: 3, creators: 3, ..Default::default() }).verdict, Verdict::RugCapable);
