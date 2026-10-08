@@ -93,7 +93,12 @@ pub async fn run_watch(app: Arc<App>, tx: mpsc::Sender<Found>) {
                         }
                     }
                 }
-                Err(e) => tracing::warn!(%addr, "watch poll failed: {e:#}"),
+                Err(e) => {
+                    if format!("{e:#}").contains("not found") {
+                        cursor.remove(addr); // RPC забыл подпись-курсор: начинаем заново
+                    }
+                    tracing::warn!(%addr, "watch poll failed: {e:#}");
+                }
             }
         }
         tokio::time::sleep(Duration::from_secs(app.poll_interval_secs.max(5))).await;
