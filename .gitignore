@@ -9,3 +9,5 @@ research/
 bot_alerted.txt
 tools/series.tar.gz
 *.patch
+out/
+__pycache__/
