@@ -48,7 +48,7 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args> {
-    let usage = "usage: dbc-replay <dbc.sqlite> <pool prefix> [--cf ...]\n       dbc-replay <dbc.sqlite> risk [config prefix] [--json [--research [--research-since UNIX]]] [--limit N]\n       dbc-replay <dbc.sqlite> clusters [config prefix]\n       dbc-replay <dbc.sqlite> templates\n       dbc-replay <dbc.sqlite> impact [--since-hours N] [--sol-usd 122]";
+    let usage = "usage: dbc-replay <dbc.sqlite> <pool prefix> [--cf ...]\n       dbc-replay <dbc.sqlite> risk [config prefix] [--json [--research [--research-since UNIX]]] [--limit N]\n       dbc-replay <dbc.sqlite> clusters [config prefix]\n       dbc-replay <dbc.sqlite> templates\n       dbc-replay <dbc.sqlite> impact [--since-hours N] [--sol-usd 122]\n       dbc-replay <dbc.sqlite> fee-traps [--since-hours 72] [--min-start 50] [--all]";
     let mut flags = HashMap::new();
     let mut switches = Vec::new();
     let mut positional = Vec::new();
@@ -61,7 +61,7 @@ fn parse_args() -> Result<Args> {
             i += 1;
             continue;
         }
-        let takes_value = !matches!(a.as_str(), "--cf" | "--verbose" | "--json" | "--research");
+        let takes_value = !matches!(a.as_str(), "--cf" | "--verbose" | "--json" | "--research" | "--all");
         if takes_value {
             let v = rest.get(i + 1).with_context(|| format!("{a} needs a value"))?;
             flags.insert(a.clone(), v.clone());
@@ -171,6 +171,7 @@ fn main() -> Result<()> {
         "clusters" => return run_clusters(&conn, &args),
         "templates" => return run_templates(&conn, &args),
         "impact" | "damage" => return run_damage(&conn, &args),
+        "fee-traps" => return run_fee_traps(&conn, &args),
         _ => {}
     }
     let init = data::find_pool(&conn, &args.prefix)?;
@@ -1210,4 +1211,184 @@ fn run_damage(conn: &rusqlite::Connection, args: &Args) -> Result<()> {
     println!("       with >=80% of its activity there (across the operator cluster); generic bots count as external.");
     println!("       linked % is n/a when fewer than 3 pools had real trading (>=3 swaps not by the creator).");
     Ok(())
+}
+
+/// Конфиги-ловушки для снайперов (исследование, в бот и README не выводится):
+/// высокая стартовая комиссия, почти вся торговая комиссия одному адресу и
+/// дополнительный доход тому же организатору (миграционная комиссия или leftover).
+/// Выводит по пулу на строку, от старых к новым.
+///   уровень A: старт ≥ 70%, один получатель ≥ 80% комиссии, доп. доход ≥ 10%, конфиг одноразовый
+///   уровень B: старт ≥ --min-start (50%) и один получатель ≥ 80% комиссии
+fn run_fee_traps(conn: &rusqlite::Connection, args: &Args) -> Result<()> {
+    let since_hours: f64 = args.num("--since-hours", 72.0)?;
+    let min_start: f64 = args.num("--min-start", 50.0)?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64;
+    let cutoff = now - (since_hours * 3600.0) as i64;
+    let mut st = conn.prepare(
+        "SELECT p.pool, p.base_mint, p.creator, p.config, p.created_time, p.tracked,
+                (SELECT block_time FROM curve_complete c WHERE c.pool = p.pool),
+                (SELECT COUNT(*) FROM pools q WHERE q.config = p.config)
+         FROM pools p WHERE p.created_time >= ?1 ORDER BY p.created_time",
+    )?;
+    type Row = (String, String, String, String, i64, i64, Option<i64>, i64);
+    let rows: Vec<Row> = st
+        .query_map(rusqlite::params![cutoff], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    let ts = |t: i64| {
+        let d = t.div_euclid(86400);
+        let (y, m, dd) = civil(d);
+        let s = t.rem_euclid(86400);
+        format!("{y:04}-{m:02}-{dd:02} {:02}:{:02}", s / 3600, s % 3600 / 60)
+    };
+    println!(
+        "{:<16}  {:<1}  {:<8}  {:>11}  {:>5}  {:<14}  {:>4}  {:>4}  {:>5}  {:>6}  {:<8}  {:<8}  {}",
+        "created UTC", "L", "mint", "fee", "secs", "fee receiver", "mig%", "left", "pools", "grad s", "creator", "claimer", "notes"
+    );
+    let (mut na, mut nb, mut checked) = (0, 0, 0);
+    let mut by_claimer: HashMap<String, usize> = HashMap::new();
+    let mut out = Vec::new();
+    for (_pool, mint, creator, config, created, tracked, grad, cfg_pools) in rows {
+        let Ok(c) = data::load_config(conn, &config) else { continue };
+        if data::load_quote_mint(conn, &config).as_deref() != Some(WSOL) {
+            continue;
+        }
+        checked += 1;
+        let bf = &c.pool_fees.base_fee;
+        if bf.base_fee_mode > 1 {
+            continue;
+        }
+        let start = bf.cliff_fee_numerator as f64 / 1e7;
+        if start < min_start && !args.has("--all") {
+            continue;
+        }
+        let end = min_fee_pct(&c).unwrap_or(start);
+        let secs = bf.first_factor as f64 * bf.second_factor as f64 * if c.activation_type == 0 { 0.4 } else { 1.0 };
+        let f = risk::config_facts(&c);
+        let cr = c.creator_trading_fee_percentage as f64;
+        let claimer = c.fee_claimer.to_string();
+        let (receiver, share) = if cr >= 50.0 { ("creator", cr) } else { ("fee claimer", 100.0 - cr) };
+        let left_pct = if f.total_supply > 0 { 100.0 * f.leftover_to_receiver as f64 / f.total_supply as f64 } else { 0.0 };
+        let extra = c.migration_fee_percentage as f64 >= 10.0 || left_pct >= 10.0;
+        let single = share >= 80.0;
+        let level = if start >= 70.0 && single && extra && cfg_pools == 1 {
+            na += 1;
+            "A"
+        } else if start >= min_start && single {
+            nb += 1;
+            "B"
+        } else if args.has("--all") {
+            "-"
+        } else {
+            continue;
+        };
+        if level != "-" {
+            *by_claimer.entry(claimer.clone()).or_default() += 1;
+        }
+        let mut notes = Vec::new();
+        if f.leftover_receiver.as_deref() == Some(claimer.as_str()) && left_pct >= 1.0 {
+            notes.push("leftover=claimer".to_string());
+        }
+        if creator == claimer {
+            notes.push("creator=claimer".to_string());
+        }
+        if tracked == 0 {
+            notes.push("swaps not tracked".to_string());
+        }
+        out.push((claimer.clone(), format!(
+            "{:<16}  {:<1}  {:<8}  {:>4.0}%→{:>4.1}%  {:>5.0}  {:<14}  {:>3}%  {:>3.0}%  {:>5}  {:>6}  {:<8}  {:<8}  {}",
+            ts(created),
+            level,
+            short(&mint),
+            start,
+            end,
+            secs,
+            format!("{receiver} {share:.0}%"),
+            c.migration_fee_percentage,
+            left_pct,
+            cfg_pools,
+            grad.map(|g| (g - created).to_string()).unwrap_or_else(|| "-".into()),
+            short(&creator),
+            short(&claimer),
+            notes.join(", ")
+        )));
+    }
+    for (claimer, line) in &out {
+        let n = by_claimer.get(claimer).copied().unwrap_or(0);
+        println!("{line}{}", if n > 1 { format!("  [claimer in {n} pools]") } else { String::new() });
+    }
+    println!(
+        "\nchecked {checked} SOL pools created in the last {since_hours} h; level A {na}, level B {nb}"
+    );
+    Ok(())
+}
+
+/// Дата по числу дней от 1970-01-01 (алгоритм Хиннанта).
+fn civil(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+#[cfg(test)]
+mod fee_traps_tests {
+    use super::*;
+    use anchor_lang::prelude::Pubkey;
+    use std::str::FromStr;
+
+    /// Конфиг как у ETdmXbqZ (75% → 3% за 180 с, 100% партнёру, миграционная комиссия 99%)
+    /// попадает в уровень A; обычный конфиг с плоской комиссией 1% не выводится.
+    #[test]
+    fn fee_traps_lists_sniper_tax_config() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pools(pool TEXT, base_mint TEXT, creator TEXT, config TEXT, created_time INTEGER, tracked INTEGER);
+             CREATE TABLE configs(config TEXT PRIMARY KEY, quote_mint TEXT, fee_claimer TEXT, raw BLOB, fetched_at INTEGER);
+             CREATE TABLE curve_complete(pool TEXT, block_time INTEGER);",
+        )
+        .unwrap();
+        let mk = |trap: bool| {
+            let mut c: PoolConfig = bytemuck::Zeroable::zeroed();
+            c.quote_mint = Pubkey::from_str(WSOL).unwrap();
+            c.fee_claimer = Pubkey::new_unique();
+            c.leftover_receiver = c.fee_claimer;
+            c.activation_type = 1;
+            c.migration_quote_threshold = 143_550_332_287;
+            c.swap_base_amount = 996_540_944_000_000;
+            if trap {
+                c.pool_fees.base_fee.base_fee_mode = 0;
+                c.pool_fees.base_fee.cliff_fee_numerator = 750_000_000;
+                c.pool_fees.base_fee.first_factor = 18;
+                c.pool_fees.base_fee.second_factor = 10;
+                c.pool_fees.base_fee.third_factor = 40_000_000;
+                c.migration_fee_percentage = 99;
+            } else {
+                c.pool_fees.base_fee.cliff_fee_numerator = 10_000_000;
+                c.creator_trading_fee_percentage = 50;
+            }
+            let mut raw = vec![26u8, 108, 14, 123, 116, 230, 129, 43];
+            raw.extend_from_slice(bytemuck::bytes_of(&c));
+            raw
+        };
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        for (i, trap) in [true, false].into_iter().enumerate() {
+            let cfg = format!("Cfg{i}xxxxxxxxxx");
+            conn.execute("INSERT INTO configs VALUES(?1, ?2, '', ?3, 0)", rusqlite::params![cfg, WSOL, mk(trap)]).unwrap();
+            conn.execute(
+                "INSERT INTO pools VALUES(?1, ?2, 'Creatorxxxxxxx', ?3, ?4, 1)",
+                rusqlite::params![format!("Pool{i}xxxxxxx"), format!("Mint{i}xxxxxxx"), cfg, now - 600],
+            )
+            .unwrap();
+        }
+        conn.execute("INSERT INTO curve_complete VALUES('Pool0xxxxxxx', ?1)", rusqlite::params![now - 600 + 1226]).unwrap();
+        let args = Args { db: String::new(), prefix: "fee-traps".into(), target: None, flags: HashMap::new(), switches: vec![] };
+        run_fee_traps(&conn, &args).unwrap();
+    }
 }
