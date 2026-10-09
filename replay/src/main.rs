@@ -48,7 +48,7 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args> {
-    let usage = "usage: dbc-replay <dbc.sqlite> <pool prefix> [--cf ...]\n       dbc-replay <dbc.sqlite> risk [config prefix] [--json [--research [--research-since UNIX]]] [--limit N]\n       dbc-replay <dbc.sqlite> clusters [config prefix]\n       dbc-replay <dbc.sqlite> templates\n       dbc-replay <dbc.sqlite> impact [--since-hours N] [--sol-usd 122]\n       dbc-replay <dbc.sqlite> fee-traps [--since-hours 72] [--min-start 50] [--all]";
+    let usage = "usage: dbc-replay <dbc.sqlite> <pool prefix> [--cf ...]\n       dbc-replay <dbc.sqlite> risk [config prefix] [--json [--research [--research-since UNIX]]] [--limit N]\n       dbc-replay <dbc.sqlite> clusters [config prefix]\n       dbc-replay <dbc.sqlite> templates\n       dbc-replay <dbc.sqlite> impact [--since-hours N] [--sol-usd 122]\n       dbc-replay <dbc.sqlite> fee-traps [--since-hours 72] [--min-start 50] [--all] [--json]";
     let mut flags = HashMap::new();
     let mut switches = Vec::new();
     let mut positional = Vec::new();
@@ -1242,10 +1242,10 @@ fn run_fee_traps(conn: &rusqlite::Connection, args: &Args) -> Result<()> {
         let s = t.rem_euclid(86400);
         format!("{y:04}-{m:02}-{dd:02} {:02}:{:02}", s / 3600, s % 3600 / 60)
     };
-    println!(
+    if !args.has("--json") { println!(
         "{:<16}  {:<1}  {:<8}  {:>11}  {:>5}  {:<14}  {:>4}  {:>4}  {:>5}  {:>6}  {:<8}  {:<8}  {}",
         "created UTC", "L", "mint", "fee", "secs", "fee receiver", "mig%", "left", "pools", "grad s", "creator", "claimer", "notes"
-    );
+    ); }
     let (mut na, mut nb, mut checked) = (0, 0, 0);
     let mut by_claimer: HashMap<String, usize> = HashMap::new();
     let mut out = Vec::new();
@@ -1296,6 +1296,21 @@ fn run_fee_traps(conn: &rusqlite::Connection, args: &Args) -> Result<()> {
         if tracked == 0 {
             notes.push("swaps not tracked".to_string());
         }
+        if args.has("--json") {
+            let j = serde_json::json!({
+                "pool": _pool, "mint": mint, "creator": creator, "config": config, "fee_claimer": claimer,
+                "leftover_receiver": f.leftover_receiver, "created": created, "graduated": grad, "cfg_pools": cfg_pools,
+                "tracked": tracked == 1, "level": level,
+                "mode": if bf.base_fee_mode == 0 { "linear" } else { "exponential" },
+                "start_pct": start, "end_pct": end, "high_fee_secs": secs, "activation_type": c.activation_type,
+                "periods": bf.first_factor, "period_len": bf.second_factor,
+                "receiver": receiver, "receiver_share_pct": share, "creator_trading_fee_pct": c.creator_trading_fee_percentage,
+                "migration_fee_pct": c.migration_fee_percentage, "creator_migration_fee_pct": c.creator_migration_fee_percentage,
+                "leftover_pct": left_pct, "threshold_sol": c.migration_quote_threshold as f64 / 1e9,
+            });
+            println!("{j}");
+            continue;
+        }
         out.push((claimer.clone(), format!(
             "{:<16}  {:<1}  {:<8}  {:>4.0}%→{:>4.1}%  {:>5.0}  {:<14}  {:>3}%  {:>3.0}%  {:>5}  {:>6}  {:<8}  {:<8}  {}",
             ts(created),
@@ -1317,6 +1332,9 @@ fn run_fee_traps(conn: &rusqlite::Connection, args: &Args) -> Result<()> {
     for (claimer, line) in &out {
         let n = by_claimer.get(claimer).copied().unwrap_or(0);
         println!("{line}{}", if n > 1 { format!("  [claimer in {n} pools]") } else { String::new() });
+    }
+    if args.has("--json") {
+        return Ok(());
     }
     println!(
         "\nchecked {checked} SOL pools created in the last {since_hours} h; level A {na}, level B {nb}"
@@ -1390,5 +1408,7 @@ mod fee_traps_tests {
         conn.execute("INSERT INTO curve_complete VALUES('Pool0xxxxxxx', ?1)", rusqlite::params![now - 600 + 1226]).unwrap();
         let args = Args { db: String::new(), prefix: "fee-traps".into(), target: None, flags: HashMap::new(), switches: vec![] };
         run_fee_traps(&conn, &args).unwrap();
+        let json = Args { db: String::new(), prefix: "fee-traps".into(), target: None, flags: HashMap::new(), switches: vec!["--json".into(), "--all".into()] };
+        run_fee_traps(&conn, &json).unwrap();
     }
 }
