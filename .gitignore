@@ -7,3 +7,5 @@ risk.json
 research/
 *:Zone.Identifier
 bot_alerted.txt
+tools/series.tar.gz
+*.patch
