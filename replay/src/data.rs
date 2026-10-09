@@ -6,9 +6,9 @@ use dynamic_bonding_curve::state::{PoolConfig, SwapResult2};
 use rusqlite::{params, Connection};
 
 /// Дискриминатор аккаунта PoolConfig (из IDL).
-const POOL_CONFIG_DISC: [u8; 8] = [26, 108, 14, 123, 116, 230, 129, 43];
+pub const POOL_CONFIG_DISC: [u8; 8] = [26, 108, 14, 123, 116, 230, 129, 43];
 /// Дискриминатор ConfigWithTransferHook: { config: PoolConfig, transfer_hook_program: Pubkey, padding }.
-const CONFIG_WITH_TH_DISC: [u8; 8] = [0x28, 0xDC, 0xC2, 0xFB, 0x29, 0xC7, 0x7B, 0xFD];
+pub const CONFIG_WITH_TH_DISC: [u8; 8] = [0x28, 0xDC, 0xC2, 0xFB, 0x29, 0xC7, 0x7B, 0xFD];
 
 pub fn open(path: &str) -> Result<Connection> {
     Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)

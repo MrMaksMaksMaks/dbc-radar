@@ -24,6 +24,7 @@ mod engine;
 mod risk;
 mod cluster;
 mod farm;
+mod dump;
 
 use anyhow::{anyhow, bail, Context, Result};
 use dynamic_bonding_curve::{
@@ -48,7 +49,7 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args> {
-    let usage = "usage: dbc-replay <dbc.sqlite> <pool prefix> [--cf ...]\n       dbc-replay <dbc.sqlite> risk [config prefix] [--json [--research [--research-since UNIX]]] [--limit N]\n       dbc-replay <dbc.sqlite> clusters [config prefix]\n       dbc-replay <dbc.sqlite> templates\n       dbc-replay <dbc.sqlite> impact [--since-hours N] [--sol-usd 122]\n       dbc-replay <dbc.sqlite> fee-traps [--since-hours 72] [--min-start 50] [--all] [--json]";
+    let usage = "usage: dbc-replay <dbc.sqlite> <pool prefix> [--cf ...]\n       dbc-replay <dbc.sqlite> risk [config prefix] [--json [--research [--research-since UNIX]]] [--limit N]\n       dbc-replay <dbc.sqlite> clusters [config prefix]\n       dbc-replay <dbc.sqlite> templates\n       dbc-replay <dbc.sqlite> impact [--since-hours N] [--sol-usd 122]\n       dbc-replay <dbc.sqlite> fee-traps [--since-hours 72] [--min-start 50] [--all] [--json]\n       dbc-replay <dbc.sqlite> config-dump <mint | pool | config>";
     let mut flags = HashMap::new();
     let mut switches = Vec::new();
     let mut positional = Vec::new();
@@ -172,6 +173,7 @@ fn main() -> Result<()> {
         "templates" => return run_templates(&conn, &args),
         "impact" | "damage" => return run_damage(&conn, &args),
         "fee-traps" => return run_fee_traps(&conn, &args),
+        "config-dump" => return dump::run(&conn, args.target.as_deref().context("config-dump <mint | pool | config>")?),
         _ => {}
     }
     let init = data::find_pool(&conn, &args.prefix)?;
