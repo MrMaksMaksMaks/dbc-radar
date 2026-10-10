@@ -19,6 +19,10 @@ const MAX_TX_PER_POOL_ROUND: usize = 150;
 const FETCH_CONCURRENCY: usize = 8;
 /// После стольких записанных свопов пул больше не опрашивается.
 const MAX_SWAPS_PER_POOL: i64 = 500;
+/// Транзакцию моложе этого возраста (с) ждём на основном узле: она может быть ещё не проиндексирована.
+/// Старше — основной узел её, скорее всего, уже не отдаст (короткая история): берём из запасного RPC
+/// или пропускаем, чтобы пул не застрял до конца окна отслеживания.
+const FRESH_TX_SECS: i64 = 120;
 
 pub async fn run(app: Arc<App>) {
     loop {
@@ -82,8 +86,20 @@ async fn poll_pool(app: &App, pool: &str, last_sig: Option<&str>) -> Result<()> 
                 app.ingest(&s.signature, &parsed).await?;
             }
             Some(None) => {
-                tracing::debug!(%pool, sig = %s.signature, "tx not yet available, retry next round");
-                return Ok(());
+                let age = s.block_time.map(|t| now_secs() - t).unwrap_or(0);
+                if age < FRESH_TX_SECS {
+                    tracing::debug!(%pool, sig = %s.signature, "tx not yet available, retry next round");
+                    return Ok(());
+                }
+                match fetch_backup(app, &s.signature).await {
+                    Some(raw) => {
+                        let parsed = parse_tx(&raw)?;
+                        app.ingest(&s.signature, &parsed).await?;
+                    }
+                    None => {
+                        tracing::warn!(%pool, sig = %s.signature, age, "tx unavailable on main and backup RPC, skipped");
+                    }
+                }
             }
         }
         app.db.set_last_sig(pool, &s.signature)?;
@@ -136,6 +152,30 @@ async fn collect_without_until(app: &App, pool: &str, last_sig: &str) -> Result<
         }
     }
     Ok(out)
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Транзакция из запасного RPC в пределах часового бюджета; None — нет запасного RPC, бюджет исчерпан
+/// или запасной узел её тоже не отдал.
+async fn fetch_backup(app: &App, sig: &str) -> Option<serde_json::Value> {
+    let rpc = app.backup_rpc.as_ref()?;
+    if !app.take_backup_budget() {
+        tracing::debug!(sig, "backup RPC hourly budget exhausted");
+        return None;
+    }
+    match rpc.get_transaction(sig).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(sig, "backup RPC getTransaction failed: {e:#}");
+            None
+        }
+    }
 }
 
 /// None — транзакция неуспешна (событий нет); Some(None) — RPC её ещё не отдаёт.

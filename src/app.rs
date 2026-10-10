@@ -24,9 +24,29 @@ pub struct App {
     pub config_allowlist: HashSet<String>,
     pub track_secs: i64,
     pub poll_interval_secs: u64,
+    /// запасной RPC для транзакций, которые основной узел уже не отдаёт (обычно HISTORY_RPC_URL)
+    pub backup_rpc: Option<Rpc>,
+    /// сколько транзакций в час можно взять из запасного RPC (бережём кредиты)
+    pub backup_max_per_hour: u32,
+    /// (номер часа, сколько взято в этом часу)
+    pub backup_used: std::sync::Mutex<(i64, u32)>,
 }
 
 impl App {
+    /// Резервирует одну транзакцию из часового бюджета запасного RPC.
+    pub fn take_backup_budget(&self) -> bool {
+        let hour = chrono_hour();
+        let mut g = self.backup_used.lock().unwrap();
+        if g.0 != hour {
+            *g = (hour, 0);
+        }
+        if g.1 >= self.backup_max_per_hour {
+            return false;
+        }
+        g.1 += 1;
+        true
+    }
+
     /// Отслеживаем пул, если его конфиг в allowlist или он попал в выборку.
     /// Выборка детерминированная: первые 8 байт адреса пула (адреса равномерно
     /// распределены), поэтому после перезапуска решения не меняются.
@@ -99,4 +119,11 @@ impl App {
             Err(e) => tracing::warn!("fetch config {config}: {e:#}"),
         }
     }
+}
+
+fn chrono_hour() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64 / 3600)
+        .unwrap_or(0)
 }

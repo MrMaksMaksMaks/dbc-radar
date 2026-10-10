@@ -62,6 +62,10 @@ async fn main() -> Result<()> {
     // отдельный узел для этой проверки (у PublicNode предел ~6 адресов на getMultipleAccounts)
     let status_rpc_url = env_or("STATUS_RPC_URL", &rpc_url);
     let status_rps: f64 = env_or("STATUS_RPC_RPS", "2").parse().context("STATUS_RPC_RPS")?;
+    // запасной RPC для транзакций, которые основной узел уже не отдаёт; по умолчанию HISTORY_RPC_URL
+    let backup_url = env_or("BACKUP_RPC_URL", &env_or("HISTORY_RPC_URL", ""));
+    let backup_rps: f64 = env_or("BACKUP_RPC_RPS", "2").parse().context("BACKUP_RPC_RPS")?;
+    let backup_max_per_hour: u32 = env_or("BACKUP_MAX_PER_HOUR", "1000").parse().context("BACKUP_MAX_PER_HOUR")?;
     let config_allowlist: HashSet<String> = env_or("CONFIG_ALLOWLIST", "")
         .split(',')
         .map(str::trim)
@@ -111,6 +115,9 @@ async fn main() -> Result<()> {
     }
 
     tracing::info!(%status_rpc_url, status_rps, "graduation check from pool accounts");
+    // в журнал — только хост запасного RPC: в URL может быть ключ
+    let backup_host = backup_url.split('/').nth(2).unwrap_or("-").to_string();
+    tracing::info!(backup = %backup_host, backup_rps, backup_max_per_hour, "backup RPC for transactions the main node no longer serves");
     let app = Arc::new(app::App {
         rpc: rpc::Rpc::new(rpc_url, rps),
         status_rpc: rpc::Rpc::new(status_rpc_url, status_rps),
@@ -122,6 +129,9 @@ async fn main() -> Result<()> {
         config_allowlist,
         track_secs: track_hours * 3600,
         poll_interval_secs,
+        backup_rpc: if backup_url.is_empty() { None } else { Some(rpc::Rpc::new(backup_url, backup_rps)) },
+        backup_max_per_hour,
+        backup_used: std::sync::Mutex::new((0, 0)),
     });
 
     let (tx, rx) = mpsc::channel::<discovery::Found>(50_000);
