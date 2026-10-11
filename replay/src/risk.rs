@@ -783,7 +783,7 @@ mod tests {
         assert_eq!((t.secs, t.receiver), (120, "the launchpad (fee claimer)"));
     }
 
-    /// Конфиг, устроенный как 2toDxUnv (см. разбор xzy19…), должен получить CRITICAL,
+    /// Конфиг бандл-шаблона (89% ликвидности создателю без блокировки, остаток 90%) должен получить CRITICAL,
     /// а тот же конфиг с заблокированной ликвидностью и без остатка — LOW.
     /// DBC_FIXTURE_CONFIG=/путь/к/fee_in_quote_config.bin ; RISK_DB=/tmp/risk.sqlite — сохранить тестовую базу.
     #[test]

@@ -263,7 +263,7 @@ mod tests {
 
     #[test]
     fn extracts_addresses_from_text_and_links() {
-        let a = "2toDxUnvDSdWz9QV2N7PTGvs9UaEoCdbznLux88mH4cY";
+        let a = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN"; // программа DBC: нейтральный адрес для теста
         assert_eq!(extract_address(a).as_deref(), Some(a));
         assert_eq!(extract_address(&format!("https://solscan.io/token/{a}?cluster=x")).as_deref(), Some(a));
         assert_eq!(extract_address("/check hello"), None);
