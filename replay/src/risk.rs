@@ -296,6 +296,33 @@ fn human_secs(s: u64) -> String {
 ///   * 100% навсегда заблокированной LP — самый частый вариант (100 из 167 конфигов), продаж «извне» в нём не наблюдалось;
 ///   * связка «creator unlocked >= 50% + leftover >= 20% supply» — 51 конфиг, 78% наблюдаемых пулов;
 ///     продажи токенов «извне» видны в 13 из 32 таких конфигов с данными и ни в одном из остальных 27.
+/// Параметры «налога на снайперов», если конфиг под него подходит.
+pub struct FeeTrap {
+    pub start_pct: f64,
+    pub secs: u64,
+    pub share_pct: f64,
+    pub receiver: &'static str,
+}
+
+pub const FEE_TRAP_MIN_START_PCT: f64 = 70.0;
+pub const FEE_TRAP_MIN_SECS: u64 = 90;
+pub const FEE_TRAP_MIN_SHARE_PCT: f64 = 80.0;
+
+pub fn fee_trap(f: &ConfigFacts) -> Option<FeeTrap> {
+    let (mode, cliff, periods, period_len, _) = f.base_fee;
+    if mode > 1 || periods == 0 || period_len == 0 {
+        return None; // ограничитель скорости или плоская комиссия
+    }
+    let start_pct = cliff as f64 / 1e7;
+    // activation_type 0: периоды в слотах (~0,4 с)
+    let raw = periods as u64 * period_len;
+    let secs = if f.activation_type == 0 { raw * 2 / 5 } else { raw };
+    let cr = f.creator_trading_fee_pct as f64;
+    let (receiver, share_pct) = if cr >= 50.0 { ("the creator", cr) } else { ("the launchpad (fee claimer)", 100.0 - cr) };
+    (start_pct >= FEE_TRAP_MIN_START_PCT && secs >= FEE_TRAP_MIN_SECS && share_pct >= FEE_TRAP_MIN_SHARE_PCT)
+        .then_some(FeeTrap { start_pct, secs, share_pct, receiver })
+}
+
 pub fn score(f: &ConfigFacts, b: &Behavior) -> Report {
     let lp = &f.lp;
     let leftover_pct = if f.total_supply > 0 { 100.0 * f.leftover_to_receiver as f64 / f.total_supply as f64 } else { 0.0 };
@@ -368,6 +395,16 @@ pub fn score(f: &ConfigFacts, b: &Behavior) -> Report {
     }
     if matches!(f.update_authority, 3 | 4) {
         add(&mut cap, 40, "a creator or partner keeps MINT authority over the token".into());
+    }
+    // «Налог на снайперов»: стартовая комиссия 70%+ снижается дольше 90 с, и 80%+ комиссии
+    // (после доли протокола) получает один адрес. Ранние покупатели отдают большую часть SOL
+    // комиссией этому адресу. Это возможность конфига (видна в параметрах), не доказательство.
+    if let Some(t) = fee_trap(f) {
+        add(&mut cap, 50, format!(
+            "sniper fee: trading fee starts at {:.0}% and decays over {}; {:.0}% of the fee (after the protocol share) goes to {}: \
+             buyers in the first minutes pay most of their SOL as fee to one address",
+            t.start_pct, human_secs(t.secs), t.share_pct, t.receiver
+        ));
     }
     let capability = cap.iter().map(|f| f.points).sum::<u32>().min(100);
 
@@ -503,6 +540,53 @@ pub fn score(f: &ConfigFacts, b: &Behavior) -> Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plain_facts() -> ConfigFacts {
+        ConfigFacts {
+            lp: LpSplit { creator_unlocked: 0, partner_unlocked: 0, locked: 100, creator_vest: 0, partner_vest: 0, vest_full_release_secs: 0 },
+            total_supply: 1_000_000_000,
+            curve_supply: 800_000_000,
+            leftover_to_receiver: 0,
+            update_authority: 1,
+            migration_fee_pct: 0,
+            has_fee_scheduler: true,
+            threshold: 85_000_000_000,
+            token_decimal: 6,
+            transfer_hook: None,
+            instant_graduation: false,
+            base_fee: (0, 0, 0, 0, 0),
+            activation_type: 1,
+            creator_trading_fee_pct: 0,
+            fee_claimer: None,
+            leftover_receiver: None,
+            leftover_receiver_configs: 1,
+        }
+    }
+
+    #[test]
+    fn sniper_fee_is_amber_not_red() {
+        let b = Behavior { pools: 20, creators: 15, ..Default::default() };
+        // 90% -> снижение 120 периодов по 1 с, 100% комиссии создателю: ловушка
+        let mut f = plain_facts();
+        f.base_fee = (0, 900_000_000, 120, 1, 7_400_000);
+        f.creator_trading_fee_pct = 100;
+        let r = score(&f, &b);
+        assert_eq!(r.verdict, Verdict::RugCapable, "{:?}", r.capability_flags);
+        assert!(r.capability_flags.iter().any(|x| x.text.starts_with("sniper fee") && x.text.contains("the creator")));
+        // то же, но комиссия делится 50/50: одного получателя нет
+        f.creator_trading_fee_pct = 50;
+        assert_eq!(score(&f, &b).verdict, Verdict::Standard);
+        // обычный антиснайпер платформы: 50% за 60 с
+        f.creator_trading_fee_pct = 0;
+        f.base_fee = (1, 500_000_000, 60, 1, 1_000);
+        assert_eq!(score(&f, &b).verdict, Verdict::Standard);
+        // периоды в слотах: 300 слотов ≈ 120 с, 80% партнёру — ловушка
+        f.base_fee = (0, 800_000_000, 30, 10, 1_000);
+        f.activation_type = 0;
+        f.creator_trading_fee_pct = 20;
+        let t = fee_trap(&f).expect("trap");
+        assert_eq!((t.secs, t.receiver), (120, "the launchpad (fee claimer)"));
+    }
 
     /// Конфиг, устроенный как 2toDxUnv (см. разбор xzy19…), должен получить CRITICAL,
     /// а тот же конфиг с заблокированной ликвидностью и без остатка — LOW.
