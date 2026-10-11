@@ -49,7 +49,7 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args> {
-    let usage = "usage: dbc-replay <dbc.sqlite> <pool prefix> [--cf ...]\n       dbc-replay <dbc.sqlite> risk [config prefix] [--json [--research [--research-since UNIX]]] [--limit N]\n       dbc-replay <dbc.sqlite> clusters [config prefix]\n       dbc-replay <dbc.sqlite> templates\n       dbc-replay <dbc.sqlite> impact [--since-hours N] [--sol-usd 122]\n       dbc-replay <dbc.sqlite> fee-traps [--since-hours 72] [--min-start 50] [--all] [--json]\n       dbc-replay <dbc.sqlite> config-dump <mint | pool | config>";
+    let usage = "usage: dbc-replay <dbc.sqlite> <pool prefix> [--cf ...]\n       dbc-replay <dbc.sqlite> risk [config prefix] [--json [--research [--research-since UNIX]]] [--limit N]\n       dbc-replay <dbc.sqlite> clusters [config prefix]\n       dbc-replay <dbc.sqlite> templates\n       dbc-replay <dbc.sqlite> impact [--since-hours N] [--sol-usd 122]\n       dbc-replay <dbc.sqlite> fee-traps [--since-hours 72] [--min-start 50] [--all] [--json]\n       dbc-replay <dbc.sqlite> config-dump <mint | pool | config>\n       dbc-replay [dbc.sqlite] thresholds   (verdict thresholds, RISK_* in env or .env)";
     let mut flags = HashMap::new();
     let mut switches = Vec::new();
     let mut positional = Vec::new();
@@ -165,6 +165,14 @@ fn fee_pct(c: &PoolConfig, s: &engine::RecordedSwap, r: &SwapResult2) -> f64 {
 }
 
 fn main() -> Result<()> {
+    // пороги вердиктов не требуют базы
+    if std::env::args().nth(1).as_deref() == Some("thresholds") || std::env::args().nth(2).as_deref() == Some("thresholds") {
+        println!("{:<34} {:>8} {:>8}  meaning", "variable", "value", "default");
+        for (k, v, d, what) in risk::thresholds().rows() {
+            println!("{k:<34} {v:>8} {d:>8}  {what}{}", if v != d { "  (changed)" } else { "" });
+        }
+        return Ok(());
+    }
     let args = parse_args()?;
     let conn = data::open(&args.db)?;
     match args.prefix.as_str() {
@@ -360,6 +368,9 @@ struct RiskRow {
     cluster: usize,
     cluster_size: usize,
     template: String,
+    /// конфигов у того же партнёра (fee_claimer) в базе и сколько из них RED / RED-LINK
+    partner_configs: usize,
+    partner_red_configs: usize,
 }
 
 struct Analysis {
@@ -442,6 +453,8 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
             rep,
             cluster: 0,
             cluster_size: 1,
+            partner_configs: 1,
+            partner_red_configs: 0,
         });
     }
 
@@ -472,6 +485,26 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
             let r = &mut rows[m];
             r.beh.farm = if fs.pools > 0 { Some(fs) } else { None };
             r.rep = risk::score(&r.facts, &r.beh);
+        }
+    }
+
+    // Защита конфигов платформ (risk::platform_guard): конфиг лаунчпада со многими создателями
+    // получает RED только при прямом доказательстве. Понижённый конфиг не переносит риск по связям
+    // и сам не получает RED-LINK: его создатели — пользователи платформы.
+    let mut partner_stats: HashMap<String, (usize, usize)> = HashMap::new();
+    for (i, info) in infos.iter().enumerate() {
+        if let Some(a) = &info.fee_claimer {
+            let e = partner_stats.entry(a.clone()).or_default();
+            e.0 += 1;
+            e.1 += (rows[i].rep.verdict == risk::Verdict::Synthetic) as usize;
+        }
+    }
+    let mut guarded = vec![false; rows.len()];
+    for (i, info) in infos.iter().enumerate() {
+        if let Some(a) = &info.fee_claimer {
+            let (n, k) = partner_stats[a];
+            let r = &mut rows[i];
+            guarded[i] = risk::platform_guard(&mut r.rep, &r.beh, n, k);
         }
     }
 
@@ -550,7 +583,7 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
     for c in &clusters {
         let reds: Vec<usize> = c.members.iter().copied().filter(|&m| red[m]).collect();
         for &m in &c.members {
-            if red[m] {
+            if red[m] || guarded[m] {
                 continue;
             }
             let mi = &infos[m];
@@ -655,14 +688,30 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
                     ),
                 });
             } else if let Some(n) = red_templates.get(&r.template) {
+                // совпадение параметров — не доказательство: по умолчанию только пояснение (0 баллов)
                 r.rep.evidence_flags.push(risk::Flag {
-                    points: 20,
+                    points: risk::thresholds().template_points,
                     text: format!("identical parameter template to {n} config(s) where trading is dominated by creator-linked wallets"),
                 });
             } else {
                 continue;
             }
             r.rep.evidence = Some(r.rep.evidence_flags.iter().map(|f| f.points).sum::<u32>().min(100));
+        }
+    }
+
+    // сколько конфигов у партнёра и сколько из них в итоге RED / RED-LINK — для пояснения в карточке
+    let mut by_partner: HashMap<String, (usize, usize)> = HashMap::new();
+    for (i, info) in infos.iter().enumerate() {
+        if let Some(a) = &info.fee_claimer {
+            let e = by_partner.entry(a.clone()).or_default();
+            e.0 += 1;
+            e.1 += matches!(rows[i].rep.verdict, risk::Verdict::Synthetic | risk::Verdict::RedLinked) as usize;
+        }
+    }
+    for (i, info) in infos.iter().enumerate() {
+        if let Some(a) = &info.fee_claimer {
+            (rows[i].partner_configs, rows[i].partner_red_configs) = by_partner[a];
         }
     }
 
@@ -770,7 +819,7 @@ fn run_risk(conn: &rusqlite::Connection, args: &Args) -> Result<()> {
             .iter()
             .map(|r| {
                 format!(
-                    "{{\"config\":{},\"quote_mint\":{},\"verdict\":\"{}\",\"verdict_text\":{},\"capability\":{},\"evidence\":{},\"cluster\":{},\"cluster_size\":{},\"template\":\"{}\",\"pools\":{},\"creators\":{},\"top_creator\":{},\"tracked\":{},\"graduated\":{},\"creator_unlocked_lp_pct\":{},\"partner_unlocked_lp_pct\":{},\"locked_lp_pct\":{},\"vested_lp_pct\":{},\"vest_full_release_secs\":{},\"leftover_to_receiver_pct\":{:.2},\"transfer_hook\":{},\"instant_graduation\":{},\"fee_claimer\":{},\"leftover_receiver\":{},\"leftover_receiver_configs\":{},\"median_prebuy_pct\":{},\"median_outside_wallets\":{},\"median_outside_sol\":{},\"capability_flags\":{},\"evidence_flags\":{}{}}}",
+                    "{{\"config\":{},\"quote_mint\":{},\"verdict\":\"{}\",\"verdict_text\":{},\"capability\":{},\"evidence\":{},\"cluster\":{},\"cluster_size\":{},\"template\":\"{}\",\"pools\":{},\"creators\":{},\"top_creator\":{},\"tracked\":{},\"graduated\":{},\"creator_unlocked_lp_pct\":{},\"partner_unlocked_lp_pct\":{},\"locked_lp_pct\":{},\"vested_lp_pct\":{},\"vest_full_release_secs\":{},\"leftover_to_receiver_pct\":{:.2},\"transfer_hook\":{},\"instant_graduation\":{},\"fee_claimer\":{},\"leftover_receiver\":{},\"leftover_receiver_configs\":{},\"median_prebuy_pct\":{},\"median_outside_wallets\":{},\"median_outside_sol\":{},\"capability_flags\":{},\"evidence_flags\":{},\"partner_configs\":{},\"partner_red_configs\":{}{}}}",
                     json_escape(&r.config),
                     r.quote_mint.as_deref().map(json_escape).unwrap_or_else(|| "null".into()),
                     r.rep.verdict.label(),
@@ -801,6 +850,8 @@ fn run_risk(conn: &rusqlite::Connection, args: &Args) -> Result<()> {
                     opt(r.beh.median_outside_sol),
                     flags_json(&r.rep.capability_flags),
                     flags_json(&r.rep.evidence_flags),
+                    r.partner_configs,
+                    r.partner_red_configs,
                     if research { research_json(r, research_since) } else { String::new() },
                 )
             })

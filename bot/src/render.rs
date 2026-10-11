@@ -18,7 +18,7 @@ pub fn title(verdict: &str) -> &'static str {
     match verdict {
         "RED" => "Synthetic launches",
         "RED-LINK" => "Linked to a synthetic-launch operator",
-        "AMBER" => "Risky config",
+        "AMBER" => "Caution",
         "SELF-GRAD" => "Instant graduation",
         "GREEN" => "No major red flags",
         _ => "Unknown",
@@ -115,7 +115,20 @@ const DISCLAIMER: &str = "Heuristic on-chain analysis of public data. Not financ
 pub fn config_report(r: &ConfigRisk) -> String {
     let v = r.verdict();
     let mut s = format!("{} {}\n{}\n\n", emoji(&v), bold(&format!("{v} — {}", title(&v))), esc(&r.s("verdict_text")));
-    s.push_str(&format!("Config {}\n\n", code(&r.s("config"))));
+    s.push_str(&format!("Config {}\n", code(&r.s("config"))));
+    // вердикт относится к конфигу, а не к лаунчпаду: показываем, сколько конфигов у партнёра и сколько из них RED
+    let pc = r.u("partner_configs");
+    if pc >= 2 {
+        s.push_str(&format!(
+            "{}\n",
+            italic(&format!(
+                "Launchpad {} has {pc} configs in the database, RED / RED-LINK at {}. The verdict is about this config, not the launchpad.",
+                short(&r.s("fee_claimer")),
+                r.u("partner_red_configs")
+            ))
+        ));
+    }
+    s.push('\n');
 
     s.push_str(&format!("{}\n", bold("What the config allows (known before the first buy)")));
     let cap = r.flags("capability_flags");
@@ -341,7 +354,7 @@ pub fn how() -> String {
     s.push_str(&format!(
         "\n🔴 {}\n🟠 {}\n⚪ {}\n🟢 {}",
         esc("RED / RED-LINK — synthetic launches or linked to their operator"),
-        esc("AMBER — risky config: the creator or launchpad can take most of the buyers' SOL or liquidity at or after migration"),
+        esc("AMBER — risky config or inconclusive suspicious trading: the creator or launchpad can take most of the buyers' SOL or liquidity during trading or at/after migration"),
         esc("SELF-GRAD — instant graduation, no market on the curve"),
         esc("GREEN — no major red flags; minor signals are listed in the report")
     ));

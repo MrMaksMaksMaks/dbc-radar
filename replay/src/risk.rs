@@ -274,7 +274,7 @@ impl Verdict {
         match self {
             Verdict::Synthetic => "synthetic launches: trading is dominated by the creator and wallets linked to it",
             Verdict::RedLinked => "shares operator addresses with configs where synthetic launches were observed",
-            Verdict::RugCapable => "risky config: the creator or launchpad can take most of the buyers' SOL or liquidity at or after migration",
+            Verdict::RugCapable => "risky config or inconclusive suspicious trading: the creator or launchpad can take most of the buyers' SOL or liquidity during trading or at/after migration",
             Verdict::SelfGraduation => "instant / self-funded graduation: no real bonding-curve market; risk moves to the post-migration DAMM v2 pool",
             Verdict::Standard => "no major red flags in config or observed behaviour",
         }
@@ -304,9 +304,158 @@ pub struct FeeTrap {
     pub receiver: &'static str,
 }
 
-pub const FEE_TRAP_MIN_START_PCT: f64 = 70.0;
-pub const FEE_TRAP_MIN_SECS: u64 = 90;
-pub const FEE_TRAP_MIN_SHARE_PCT: f64 = 80.0;
+/// Пороги вердиктов. Значения по умолчанию — те, на которых движок проверялся на данных;
+/// любое можно переопределить переменной окружения (или строкой в ./.env), например
+/// RISK_FEE_TRAP_MIN_START_PCT=60. Неверное значение — предупреждение в stderr и значение по умолчанию.
+/// `dbc-replay <db> thresholds` печатает действующие значения.
+#[derive(Debug, Clone)]
+pub struct Thresholds {
+    pub red_min_evidence: u32,
+    pub amber_min_capability: u32,
+    pub strong_linked_share: f64,
+    pub strong_fanout_wallets: f64,
+    pub fast_migration_secs: f64,
+    pub fee_trap_min_start_pct: f64,
+    pub fee_trap_min_secs: u64,
+    pub fee_trap_min_share_pct: f64,
+    pub fee_trap_points: u32,
+    pub template_points: u32,
+    pub platform_min_configs: usize,
+    pub platform_min_creators: u64,
+}
+
+impl Default for Thresholds {
+    fn default() -> Self {
+        Thresholds {
+            red_min_evidence: 50,
+            amber_min_capability: 50,
+            strong_linked_share: 0.8,
+            strong_fanout_wallets: 10.0,
+            fast_migration_secs: 300.0,
+            fee_trap_min_start_pct: 70.0,
+            fee_trap_min_secs: 90,
+            fee_trap_min_share_pct: 80.0,
+            fee_trap_points: 50,
+            template_points: 0,
+            platform_min_configs: 5,
+            platform_min_creators: 10,
+        }
+    }
+}
+
+/// (переменная, значение, по умолчанию, что задаёт)
+pub type ThresholdRow = (&'static str, String, String, &'static str);
+
+impl Thresholds {
+    pub fn from_env() -> Self {
+        let file = std::fs::read_to_string(".env").unwrap_or_default();
+        let get = |k: &str| -> Option<String> {
+            std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).or_else(|| {
+                file.lines()
+                    .find_map(|l| l.trim().strip_prefix(k).and_then(|r| r.strip_prefix('=')))
+                    .map(|v| v.trim().trim_matches('"').to_string())
+                    .filter(|v| !v.is_empty())
+            })
+        };
+        fn parse<T: std::str::FromStr + Copy>(v: Option<String>, k: &str, d: T) -> T {
+            match v {
+                None => d,
+                Some(v) => v.parse().unwrap_or_else(|_| {
+                    eprintln!("warning: {k}={v} is not a valid number, using the default");
+                    d
+                }),
+            }
+        }
+        let d = Self::default();
+        let mut t = Self::default();
+        macro_rules! set {
+            ($field:ident, $key:literal) => {
+                t.$field = parse(get($key), $key, d.$field);
+            };
+        }
+        set!(red_min_evidence, "RISK_RED_MIN_EVIDENCE");
+        set!(amber_min_capability, "RISK_AMBER_MIN_CAPABILITY");
+        set!(strong_linked_share, "RISK_STRONG_LINKED_SHARE");
+        set!(strong_fanout_wallets, "RISK_STRONG_FANOUT_WALLETS");
+        set!(fast_migration_secs, "RISK_FAST_MIGRATION_SECS");
+        set!(fee_trap_min_start_pct, "RISK_FEE_TRAP_MIN_START_PCT");
+        set!(fee_trap_min_secs, "RISK_FEE_TRAP_MIN_SECS");
+        set!(fee_trap_min_share_pct, "RISK_FEE_TRAP_MIN_SHARE_PCT");
+        set!(fee_trap_points, "RISK_FEE_TRAP_POINTS");
+        set!(template_points, "RISK_TEMPLATE_POINTS");
+        set!(platform_min_configs, "RISK_PLATFORM_GUARD_MIN_CONFIGS");
+        set!(platform_min_creators, "RISK_PLATFORM_GUARD_MIN_CREATORS");
+        t
+    }
+
+    pub fn rows(&self) -> Vec<ThresholdRow> {
+        let d = Self::default();
+        vec![
+            ("RISK_RED_MIN_EVIDENCE", self.red_min_evidence.to_string(), d.red_min_evidence.to_string(),
+             "evidence points needed for RED (plus a strong trading signal)"),
+            ("RISK_AMBER_MIN_CAPABILITY", self.amber_min_capability.to_string(), d.amber_min_capability.to_string(),
+             "capability points needed for AMBER"),
+            ("RISK_STRONG_LINKED_SHARE", self.strong_linked_share.to_string(), d.strong_linked_share.to_string(),
+             "share of volume from creator-linked wallets that counts as a strong trading signal"),
+            ("RISK_STRONG_FANOUT_WALLETS", self.strong_fanout_wallets.to_string(), d.strong_fanout_wallets.to_string(),
+             "median wallets per pool selling tokens they never bought: strong fan-out signal"),
+            ("RISK_FAST_MIGRATION_SECS", self.fast_migration_secs.to_string(), d.fast_migration_secs.to_string(),
+             "curve filled faster than this (median, s) is flagged"),
+            ("RISK_FEE_TRAP_MIN_START_PCT", self.fee_trap_min_start_pct.to_string(), d.fee_trap_min_start_pct.to_string(),
+             "sniper fee: minimum starting trading fee, %"),
+            ("RISK_FEE_TRAP_MIN_SECS", self.fee_trap_min_secs.to_string(), d.fee_trap_min_secs.to_string(),
+             "sniper fee: minimum fee decay duration, s"),
+            ("RISK_FEE_TRAP_MIN_SHARE_PCT", self.fee_trap_min_share_pct.to_string(), d.fee_trap_min_share_pct.to_string(),
+             "sniper fee: minimum share of the fee taken by one address, %"),
+            ("RISK_FEE_TRAP_POINTS", self.fee_trap_points.to_string(), d.fee_trap_points.to_string(),
+             "capability points for the sniper fee (>= AMBER threshold makes it AMBER on its own)"),
+            ("RISK_TEMPLATE_POINTS", self.template_points.to_string(), d.template_points.to_string(),
+             "evidence points for sharing a parameter template with RED configs (0 = note only)"),
+            ("RISK_PLATFORM_GUARD_MIN_CONFIGS", self.platform_min_configs.to_string(), d.platform_min_configs.to_string(),
+             "platform guard: launchpad with at least this many configs, under half of them RED"),
+            ("RISK_PLATFORM_GUARD_MIN_CREATORS", self.platform_min_creators.to_string(), d.platform_min_creators.to_string(),
+             "platform guard: config with at least this many creators needs direct evidence for RED"),
+        ]
+    }
+}
+
+static THRESHOLDS: std::sync::OnceLock<Thresholds> = std::sync::OnceLock::new();
+
+/// Действующие пороги (читаются один раз за запуск).
+pub fn thresholds() -> &'static Thresholds {
+    THRESHOLDS.get_or_init(Thresholds::from_env)
+}
+
+/// Защита конфигов платформ: конфиг лаунчпада (у партнёра много конфигов, синтетика меньше чем
+/// в половине), где запускают многие создатели, получает RED только при прямом доказательстве —
+/// массовой раздаче или торговле через подставные кошельки. Иначе AMBER с пояснением:
+/// признаки остаются видны, но вердикт не читается как обвинение платформы.
+/// Возвращает true, если вердикт понижен.
+pub fn platform_guard(rep: &mut Report, b: &Behavior, partner_configs: usize, partner_synthetic: usize) -> bool {
+    let th = thresholds();
+    if rep.verdict != Verdict::Synthetic
+        || partner_configs < th.platform_min_configs
+        || partner_synthetic * 2 >= partner_configs
+        || b.creators < th.platform_min_creators
+    {
+        return false;
+    }
+    let fanout = b.median_outside_wallets.unwrap_or(0.0) >= th.strong_fanout_wallets;
+    let proxies = b.farm.as_ref().is_some_and(|f| f.master_wallets >= 1);
+    if fanout || proxies {
+        return false;
+    }
+    rep.evidence_flags.push(Flag {
+        points: 0,
+        text: format!(
+            "config of a launchpad with {partner_configs} configs (synthetic trading in {partner_synthetic}) used by {} creators: \
+             here RED needs direct evidence (mass fan-out or trading through proxy wallets), so the signals above are a warning",
+            b.creators
+        ),
+    });
+    rep.verdict = Verdict::RugCapable;
+    true
+}
 
 pub fn fee_trap(f: &ConfigFacts) -> Option<FeeTrap> {
     let (mode, cliff, periods, period_len, _) = f.base_fee;
@@ -319,11 +468,13 @@ pub fn fee_trap(f: &ConfigFacts) -> Option<FeeTrap> {
     let secs = if f.activation_type == 0 { raw * 2 / 5 } else { raw };
     let cr = f.creator_trading_fee_pct as f64;
     let (receiver, share_pct) = if cr >= 50.0 { ("the creator", cr) } else { ("the launchpad (fee claimer)", 100.0 - cr) };
-    (start_pct >= FEE_TRAP_MIN_START_PCT && secs >= FEE_TRAP_MIN_SECS && share_pct >= FEE_TRAP_MIN_SHARE_PCT)
+    let th = thresholds();
+    (start_pct >= th.fee_trap_min_start_pct && secs >= th.fee_trap_min_secs && share_pct >= th.fee_trap_min_share_pct)
         .then_some(FeeTrap { start_pct, secs, share_pct, receiver })
 }
 
 pub fn score(f: &ConfigFacts, b: &Behavior) -> Report {
+    let th = thresholds();
     let lp = &f.lp;
     let leftover_pct = if f.total_supply > 0 { 100.0 * f.leftover_to_receiver as f64 / f.total_supply as f64 } else { 0.0 };
 
@@ -400,7 +551,7 @@ pub fn score(f: &ConfigFacts, b: &Behavior) -> Report {
     // (после доли протокола) получает один адрес. Ранние покупатели отдают большую часть SOL
     // комиссией этому адресу. Это возможность конфига (видна в параметрах), не доказательство.
     if let Some(t) = fee_trap(f) {
-        add(&mut cap, 50, format!(
+        add(&mut cap, th.fee_trap_points, format!(
             "sniper fee: trading fee starts at {:.0}% and decays over {}; {:.0}% of the fee (after the protocol share) goes to {}: \
              buyers in the first minutes pay most of their SOL as fee to one address",
             t.start_pct, human_secs(t.secs), t.share_pct, t.receiver
@@ -413,7 +564,7 @@ pub fn score(f: &ConfigFacts, b: &Behavior) -> Report {
     let self_grad = f.instant_graduation
         || matches!((b.median_prebuy_pct, b.median_outside_wallets), (Some(p), Some(w)) if p >= 95.0 && w < 1.0);
     if let Some(w) = b.median_outside_wallets {
-        if w >= 10.0 {
+        if w >= th.strong_fanout_wallets {
             add(&mut ev, 30, format!(
                 "fan-out: median {:.0} wallets per pool sold tokens they never bought in the pool ({:.2} SOL per pool)",
                 w,
@@ -426,14 +577,14 @@ pub fn score(f: &ConfigFacts, b: &Behavior) -> Report {
     if let Some(fs) = &b.farm {
         if let Some(sh) = fs.median_linked_share {
             let only_creator = fs.farm_wallets < 3 && fs.master_wallets == 0;
-            if sh >= 0.8 && only_creator {
+            if sh >= th.strong_linked_share && only_creator {
                 // почти весь объём — сделки самого создателя: другие почти не торгуют
                 // (брошенный запуск или продажа внешним), это не производство объёма фермой
                 add(&mut ev, 20, format!(
                     "{:.0}% of trading volume (median per pool) comes from the creator itself: few other traders",
                     sh * 100.0
                 ));
-            } else if sh >= 0.8 {
+            } else if sh >= th.strong_linked_share {
                 let masters = if fs.master_wallets > 0 {
                     format!(" and {} wallet(s) trading through proxy signers", fs.master_wallets)
                 } else {
@@ -495,7 +646,7 @@ pub fn score(f: &ConfigFacts, b: &Behavior) -> Report {
             );
         }
         if let Some(m) = fs.median_migration_secs {
-            if m < 300.0 && !f.instant_graduation {
+            if m < th.fast_migration_secs && !f.instant_graduation {
                 add(
                     &mut ev,
                     10,
@@ -520,15 +671,15 @@ pub fn score(f: &ConfigFacts, b: &Behavior) -> Report {
     // вердикт тогда определяется конфигом, а признаки остаются видны в отчёте.
     // 80% связанного объёма засчитывается, только если связаны не один создатель:
     // 3+ кошелька фермы или мастер-кошелёк с прокси (иначе это объём самого создателя).
-    let strong_trading = b.median_outside_wallets.unwrap_or(0.0) >= 10.0
+    let strong_trading = b.median_outside_wallets.unwrap_or(0.0) >= th.strong_fanout_wallets
         || b.farm.as_ref().is_some_and(|fs| {
-            fs.median_linked_share.unwrap_or(0.0) >= 0.8 && (fs.farm_wallets >= 3 || fs.master_wallets >= 1)
+            fs.median_linked_share.unwrap_or(0.0) >= th.strong_linked_share && (fs.farm_wallets >= 3 || fs.master_wallets >= 1)
         });
-    let verdict = if evidence.unwrap_or(0) >= 50 && strong_trading {
+    let verdict = if evidence.unwrap_or(0) >= th.red_min_evidence && strong_trading {
         Verdict::Synthetic
     } else if self_grad {
         Verdict::SelfGraduation
-    } else if capability >= 50 {
+    } else if capability >= th.amber_min_capability {
         Verdict::RugCapable
     } else {
         Verdict::Standard
@@ -561,6 +712,50 @@ mod tests {
             leftover_receiver: None,
             leftover_receiver_configs: 1,
         }
+    }
+
+    #[test]
+    fn platform_guard_needs_direct_evidence() {
+        let red = || Report {
+            capability: 0,
+            capability_flags: vec![],
+            evidence: Some(55),
+            evidence_flags: vec![],
+            verdict: Verdict::Synthetic,
+        };
+        let farm = |masters| Some(crate::farm::FarmStats { master_wallets: masters, ..Default::default() });
+        // конфиг лаунчпада (7 конфигов, синтетика в 2), 30 создателей, без раздачи и прокси → AMBER
+        let b = Behavior { pools: 62, creators: 30, median_outside_wallets: Some(1.0), farm: farm(0), ..Default::default() };
+        let mut r = red();
+        assert!(platform_guard(&mut r, &b, 7, 2));
+        assert_eq!(r.verdict, Verdict::RugCapable);
+        assert!(r.evidence_flags.iter().any(|f| f.points == 0 && f.text.contains("launchpad with 7 configs")));
+        // массовая раздача — прямое доказательство, RED остаётся
+        let mut r = red();
+        assert!(!platform_guard(&mut r, &Behavior { median_outside_wallets: Some(27.0), ..b.clone() }, 7, 2));
+        assert_eq!(r.verdict, Verdict::Synthetic);
+        // торговля через подставные кошельки — тоже
+        let mut r = red();
+        assert!(!platform_guard(&mut r, &Behavior { farm: farm(1), ..b.clone() }, 7, 2));
+        // мало создателей: конфиг фактически одного оператора
+        let mut r = red();
+        assert!(!platform_guard(&mut r, &Behavior { creators: 7, ..b.clone() }, 7, 2));
+        // у партнёра один конфиг (бандл-шаблон) или синтетика у половины конфигов: не платформа
+        let mut r = red();
+        assert!(!platform_guard(&mut r, &b, 1, 1));
+        let mut r = red();
+        assert!(!platform_guard(&mut r, &b, 6, 3));
+        // не RED — не трогаем
+        let mut r = Report { verdict: Verdict::Standard, ..red() };
+        assert!(!platform_guard(&mut r, &b, 7, 2));
+        assert_eq!(r.verdict, Verdict::Standard);
+    }
+
+    #[test]
+    fn thresholds_default_and_list() {
+        let t = Thresholds::default();
+        assert_eq!((t.red_min_evidence, t.template_points, t.fee_trap_points), (50, 0, 50));
+        assert!(t.rows().iter().all(|(k, v, d, _)| k.starts_with("RISK_") && v == d));
     }
 
     #[test]
