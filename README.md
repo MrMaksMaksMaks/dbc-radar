@@ -73,7 +73,7 @@ All of this is visible from the config account and the first trades, **before to
 
 ## Cross-check with Jupiter
 
-Jupiter publishes its own token signals through the Tokens API: `organicScore` (0–100) and an `audit.isSus` flag for suspicious tokens. We compared them with DBC Radar verdicts on the same tokens (`tools/organic_compare.py`). The sample is balanced across operator clusters — up to five tokens from each independent cluster, tokens 2 hours to 7 days old — so the largest operator cannot dominate it. As of October 7, 2026:
+Jupiter publishes its own token signals through the Tokens API: `organicScore` (0–100) and an `audit.isSus` flag for suspicious tokens. We compared them with DBC Radar verdicts on the same tokens, with a research script run next to the collector. The sample is balanced across operator clusters — up to five tokens from each independent cluster, tokens 2 hours to 7 days old — so the largest operator cannot dominate it. As of October 7, 2026:
 
 | DBC Radar verdict | Flagged `isSus` by Jupiter |
 |---|---|
@@ -246,18 +246,6 @@ The evidence report covers the opening buy, where sellers' tokens came from, sel
 ./replay/target/release/dbc-replay dbc.sqlite <pool-prefix> [--cf]   # bit-exact replay of a pool, optional counterfactual fees
 ```
 
-### Research tools
-
-Python scripts in `tools/` (standard library only) for checks that need full transaction history; they read `HISTORY_RPC_URL` and never print it.
-
-```bash
-python3 tools/post_migration.py <cluster> <pools> <max_tx> [--tokens=...] [--ungraduated] [-v]   # full cycle per token: curve, migration, DAMM v2
-python3 tools/token_txs.py <mint-prefix>                     # every transaction of one token with labelled participants
-python3 tools/bundle_check.py --fast=10                      # who funded the wallets that bought in the first slots
-python3 tools/organic_compare.py --per-cluster=5             # DBC Radar verdicts vs Jupiter Organic Score / isSus
-python3 tools/token_meta.py 15 cluster=<id> verdict=GREEN    # token metadata by group: hosting, platform, links
-```
-
 ### Configuration (`.env`)
 
 | Variable | Used by | Meaning |
@@ -278,13 +266,12 @@ python3 tools/token_meta.py 15 cluster=<id> verdict=GREEN    # token metadata by
 | `TELEGRAM_BOT_USERNAME` | bot | used for links from the alert channel |
 | `REPLAY_BIN` | bot | path to `dbc-replay` (default `replay/target/release/dbc-replay`) |
 | `REFRESH_SECS` | bot | how often verdicts are recomputed (default 300) |
-| `HISTORY_RPC_URL` | bot, tools | RPC with full transaction history, for finding the pool of an older token |
+| `HISTORY_RPC_URL` | bot | RPC with full transaction history, for finding the pool of an older token |
 | `ALERT_CHAT`, `DIGEST_SECS` | bot | alert channel (`@name` or id) and digest period |
 | `API_BIND` | bot | API listen address, e.g. `127.0.0.1:8080` (empty = off) |
 | `API_KEYS` | bot | comma-separated API keys (on-chain lookups, full addresses, higher limit) |
 | `API_RATE_PUBLIC`, `API_RATE_KEY` | bot | requests per minute per IP without / with a key |
 | `RISK_*` | engine, bot | verdict thresholds, see [Tuning thresholds](#tuning-thresholds) |
-| `JUPITER_API_KEY` | tools | key for the Jupiter Tokens API, used only by `tools/organic_compare.py` |
 
 ## Validation
 
@@ -303,7 +290,7 @@ python3 tools/token_meta.py 15 cluster=<id> verdict=GREEN    # token metadata by
 - The actual payer of each swap is recorded from October 7, 2026; for older swaps the engine falls back to the signer, so trading through proxy signers is recognised only in newer pools.
 - An operator that uses fresh, unrelated wallets for every launch weakens the farm signals; config capability, address links and master-wallet detection still apply.
 - The sniper fee is judged by the full length of the fee schedule, not by how long the fee stays above 70%; whether the fee was actually collected is not checked.
-- Post-migration activity in DAMM v2, including liquidity withdrawal, is analysed by the research tools, not yet by the engine.
+- Post-migration activity in DAMM v2, including liquidity withdrawal, is checked in transaction-level research traces, not yet by the engine.
 - Graduation comes from the decoded `EvtCurveComplete` event; when the completing transaction was not collected, from the pool account's `finish_curve_timestamp`.
 - Verdicts are heuristic analysis of public on-chain data, not financial advice.
 
