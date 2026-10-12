@@ -1,8 +1,8 @@
-//! Данные для бота: база сборщика (только чтение) и кэш оценок конфигов.
+//! Data for the bot: the collector database (read-only) and the config score cache.
 //!
-//! Кэш заполняется выводом `dbc-replay <db> risk --json`: так бот использует ту же оценку,
-//! что и движок, без дублирования логики. Пересчёт — по таймеру и по запросу, когда
-//! пользователь спрашивает о пуле с ещё неизвестным конфигом.
+//! The cache is filled from the output of `dbc-replay <db> risk --json`: this way the bot uses the same scoring
+//! as the engine, without duplicating logic. Refresh happens on a timer and on demand, when
+//! a user asks about a pool with a config not yet known.
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
@@ -17,7 +17,7 @@ pub fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-/// Оценка одного конфига (одна запись из `risk --json`).
+/// Score of one config (one entry from `risk --json`).
 #[derive(Debug, Clone)]
 pub struct ConfigRisk(pub Value);
 
@@ -34,7 +34,7 @@ impl ConfigRisk {
     pub fn verdict(&self) -> String {
         self.s("verdict")
     }
-    /// Флаги с баллами: (баллы, текст).
+    /// Flags with points: (points, text).
     pub fn scored_flags(&self, k: &str) -> Vec<(i64, String)> {
         self.0
             .get(k)
@@ -87,13 +87,13 @@ impl State {
             .with_context(|| format!("open {}", self.cfg.db_path))
     }
 
-    /// Пересчитать кэш. Если пересчёт уже идёт, дождаться его и не запускать второй.
+    /// Refresh the cache. If a refresh is already running, wait for it and do not start a second one.
     pub async fn refresh(&self) -> Result<()> {
         let requested = Instant::now();
         let _guard = self.refresh_lock.lock().await;
         if let Some(t) = self.cache.read().await.refreshed_at {
             if t >= requested {
-                return Ok(()); // пока ждали, кэш уже обновили
+                return Ok(()); // while we waited, the cache was already refreshed
             }
         }
         let started = Instant::now();
@@ -129,7 +129,7 @@ impl State {
     }
 }
 
-/// Пул из базы сборщика.
+/// Pool from the collector database.
 #[derive(Debug, Clone)]
 pub struct PoolInfo {
     pub pool: String,
@@ -139,7 +139,7 @@ pub struct PoolInfo {
     pub created_time: Option<i64>,
     pub tracked: bool,
     pub graduated_time: Option<i64>,
-    /// только для отслеживаемых пулов
+    /// only for tracked pools
     pub swaps: Option<PoolSwaps>,
 }
 
@@ -151,7 +151,7 @@ pub struct PoolSwaps {
     pub fanout_sellers: u64,
 }
 
-/// Найти пул по адресу пула или по адресу токена.
+/// Find a pool by pool address or by token address.
 pub fn find_pool(conn: &Connection, addr: &str) -> Result<Option<PoolInfo>> {
     let row = conn
         .query_row(
@@ -215,7 +215,7 @@ pub fn config_exists(conn: &Connection, addr: &str) -> Result<bool> {
         .is_some())
 }
 
-/// Последние пулы конфига: (pool, base_mint, created_time, graduated).
+/// Latest pools of a config: (pool, base_mint, created_time, graduated).
 pub fn recent_pools(conn: &Connection, config: &str, n: usize) -> Result<Vec<(String, String, Option<i64>, bool)>> {
     let mut st = conn.prepare(
         "SELECT pool, base_mint, created_time, EXISTS(SELECT 1 FROM curve_complete c WHERE c.pool = p.pool)
@@ -227,7 +227,7 @@ pub fn recent_pools(conn: &Connection, config: &str, n: usize) -> Result<Vec<(St
     Ok(v)
 }
 
-/// Пулы, созданные после `since`: config -> количество.
+/// Pools created after `since`: config -> count.
 pub fn pools_since(conn: &Connection, since: i64) -> Result<HashMap<String, u64>> {
     let mut st = conn.prepare("SELECT config, COUNT(*) FROM pools WHERE created_time >= ?1 GROUP BY config")?;
     let m = st
@@ -236,7 +236,7 @@ pub fn pools_since(conn: &Connection, since: i64) -> Result<HashMap<String, u64>
     Ok(m)
 }
 
-/// Последние пулы (до `limit`) за последние `secs` секунд: (pool, config, base_mint, created_time).
+/// Latest pools (up to `limit`) over the last `secs` seconds: (pool, config, base_mint, created_time).
 pub fn latest_pools(conn: &Connection, secs: i64, limit: usize) -> Result<Vec<(String, String, String, Option<i64>)>> {
     let mut st = conn.prepare(
         "SELECT pool, config, base_mint, created_time FROM pools
@@ -248,8 +248,8 @@ pub fn latest_pools(conn: &Connection, secs: i64, limit: usize) -> Result<Vec<(S
     Ok(v)
 }
 
-/// Похоже ли на адрес Solana (base58, 32–44 символа). Возвращает первый такой фрагмент сообщения,
-/// чтобы принимать и ссылки Solscan / DexScreener / Jupiter.
+/// Whether it looks like a Solana address (base58, 32–44 chars). Returns the first such fragment of the message,
+/// so Solscan / DexScreener / Jupiter links are accepted too.
 pub fn extract_address(text: &str) -> Option<String> {
     const B58: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
     text.split(|c: char| !B58.contains(c))
@@ -263,7 +263,7 @@ mod tests {
 
     #[test]
     fn extracts_addresses_from_text_and_links() {
-        let a = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN"; // программа DBC: нейтральный адрес для теста
+        let a = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN"; // DBC program: a neutral address for the test
         assert_eq!(extract_address(a).as_deref(), Some(a));
         assert_eq!(extract_address(&format!("https://solscan.io/token/{a}?cluster=x")).as_deref(), Some(a));
         assert_eq!(extract_address("/check hello"), None);

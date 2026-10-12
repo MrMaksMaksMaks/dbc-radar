@@ -1,11 +1,11 @@
-//! config-dump: все поля конфига и пула DBC прямо из структур программы —
-//! ровно то, что может прочитать любой бот из публичных аккаунтов.
+//! config-dump: all fields of a DBC config and pool, straight from the program's structs —
+//! exactly what any bot can read from the public accounts.
 //!
-//!   dbc-replay dbc.sqlite config-dump <минт | пул | конфиг (адрес или начало)>
+//!   dbc-replay dbc.sqlite config-dump <mint | pool | config (address or prefix)>
 //!
-//! Конфиг берётся из базы коллектора, а если его там нет — по RPC.
-//! Состояние пула (резервы, накопленные комиссии, статус миграции) всегда читается по RPC:
-//! HISTORY_RPC_URL или RPC_URL из окружения или из ./.env.
+//! The config is taken from the collector database, or over RPC if it is not there.
+//! The pool state (reserves, accumulated fees, migration status) is always read over RPC:
+//! HISTORY_RPC_URL or RPC_URL from the environment or from ./.env.
 
 use crate::data::{CONFIG_WITH_TH_DISC, POOL_CONFIG_DISC};
 use anyhow::{anyhow, bail, Context, Result};
@@ -24,7 +24,7 @@ fn rpc_url() -> Option<String> {
             }
         }
     }
-    // запасной вариант: ./.env рядом с базой
+    // fallback: ./.env next to the database
     let text = std::fs::read_to_string(".env").ok()?;
     for k in ["HISTORY_RPC_URL", "RPC_URL"] {
         for line in text.lines() {
@@ -56,7 +56,7 @@ fn account(url: &str, addr: &str) -> Result<Option<(Vec<u8>, String)>> {
     Ok(Some((base64::engine::general_purpose::STANDARD.decode(data)?, owner)))
 }
 
-/// Пул по минту через getProgramAccounts (если минта нет в базе).
+/// Pool by mint via getProgramAccounts (if the mint is not in the database).
 fn pool_by_mint(url: &str, mint: &str) -> Result<Option<String>> {
     let off = 8 + std::mem::offset_of!(PoolState, base_mint);
     let size = 8 + std::mem::size_of::<PoolState>();
@@ -88,7 +88,7 @@ fn parse_config(raw: &[u8]) -> Result<(PoolConfig, Option<String>)> {
 
 pub fn run(conn: &Connection, target: &str) -> Result<()> {
     let like = format!("{target}%");
-    // 1. база: минт → пул/конфиг, пул → конфиг, конфиг
+    // 1. database: mint → pool/config, pool → config, config
     let mut pool: Option<String> = conn
         .query_row("SELECT pool FROM pools WHERE base_mint LIKE ?1 LIMIT 1", params![like], |r| r.get(0))
         .optional()?;
@@ -105,7 +105,7 @@ pub fn run(conn: &Connection, target: &str) -> Result<()> {
     };
     let url = rpc_url();
 
-    // 2. не нашли в базе — полный адрес по RPC: конфиг, пул или минт
+    // 2. not found in the database — full address over RPC: config, pool or mint
     if pool.is_none() && config.is_none() {
         let url = url.as_deref().ok_or_else(|| anyhow!("{target} not in db and no HISTORY_RPC_URL/RPC_URL for an on-chain lookup"))?;
         match account(url, target)? {
@@ -120,7 +120,7 @@ pub fn run(conn: &Connection, target: &str) -> Result<()> {
         }
     }
 
-    // 3. пул по RPC (и конфиг из него, если ещё неизвестен)
+    // 3. pool over RPC (and its config, if not known yet)
     let mut pool_state: Option<PoolState> = None;
     if let (Some(p), Some(url)) = (&pool, url.as_deref()) {
         if let Some((raw, _)) = account(url, p)? {
@@ -136,7 +136,7 @@ pub fn run(conn: &Connection, target: &str) -> Result<()> {
     }
     let config = config.context("config unknown")?;
 
-    // 4. конфиг: база, иначе RPC
+    // 4. config: database, otherwise RPC
     let (cfg, hook, source) = match crate::data::load_raw(conn, &config) {
         Some(raw) => {
             let (c, h) = parse_config(&raw)?;
@@ -167,7 +167,7 @@ pub fn run(conn: &Connection, target: &str) -> Result<()> {
     Ok(())
 }
 
-/// Сворачивает числовые массивы из `{:#?}` (паддинги, байты) в одну строку.
+/// Collapses numeric arrays from `{:#?}` (padding, bytes) into a single line.
 fn compact(s: &str) -> String {
     let lines: Vec<&str> = s.lines().collect();
     let mut out = Vec::with_capacity(lines.len());

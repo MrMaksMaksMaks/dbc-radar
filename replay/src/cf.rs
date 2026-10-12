@@ -1,16 +1,16 @@
-//! Контрфактический повтор: те же сделки, другой конфиг комиссий.
+//! Counterfactual replay: the same trades, a different fee config.
 //!
-//! Модель поведения трейдеров (статический повтор):
-//!   * покупки повторяются с теми же входными суммами (exact in — та же сумма quote,
-//!     exact out — то же желаемое количество base);
-//!   * продажа моделируется как ДОЛЯ от позиции кошелька: если в реальности кошелёк
-//!     продал 40% своих токенов, в симуляции он продаёт 40% от того, что у него есть
-//!     в симуляции. Иначе при высокой комиссии на входе кошелёк "продал бы" токены,
-//!     которых у него нет;
-//!   * если кошелёк продаёт больше, чем купил в этом пуле (токены пришли извне),
-//!     продажа повторяется как есть и кошелёк помечается как external;
-//!   * после завершения кривой сделки пропускаются.
-//! Реакцию трейдеров на другие комиссии модель не учитывает — это оценка, а не прогноз.
+//! Trader behaviour model (static replay):
+//!   * buys are replayed with the same input amounts (exact in — the same quote amount,
+//!     exact out — the same desired base amount);
+//!   * a sell is modelled as a SHARE of the wallet's position: if in reality the wallet
+//!     sold 40% of its tokens, in the simulation it sells 40% of what it holds
+//!     in the simulation. Otherwise, with a high entry fee, the wallet "would sell" tokens
+//!     it does not have;
+//!   * if a wallet sells more than it bought in this pool (tokens came from outside),
+//!     the sell is replayed as is and the wallet is marked as external;
+//!   * after the curve completes, trades are skipped.
+//! The model does not account for traders reacting to different fees — this is an estimate, not a forecast.
 
 use crate::engine::{simulate_swap, RecordedSwap, SwapInput};
 use anyhow::{anyhow, bail, Result};
@@ -24,15 +24,15 @@ use std::collections::BTreeMap;
 
 const FEE_DENOMINATOR: f64 = 1_000_000_000.0;
 
-/// Расписание базовой комиссии (планировщик DBC).
+/// Base fee schedule (the DBC scheduler).
 #[derive(Debug, Clone)]
 pub struct FeeSchedule {
-    /// 0 = линейный, 1 = экспоненциальный (как base_fee_mode в DBC)
+    /// 0 = linear, 1 = exponential (as base_fee_mode in DBC)
     pub mode: u8,
     pub start_pct: f64,
     pub end_pct: f64,
     pub periods: u16,
-    /// длина периода в слотах или секундах — в единицах activation_type конфига
+    /// period length in slots or seconds — in the units of the config's activation_type
     pub period_len: u64,
 }
 
@@ -51,8 +51,8 @@ impl FeeSchedule {
     }
 }
 
-/// Копия конфига с другим планировщиком комиссии. Проверяется теми же правилами,
-/// что и при создании конфига onchain (минимум 0,25%, максимум 99% и т.д.).
+/// Copy of a config with a different fee scheduler. Validated by the same rules
+/// as when a config is created onchain (minimum 0.25%, maximum 99%, etc.).
 pub fn with_schedule(config: &PoolConfig, s: &FeeSchedule) -> Result<PoolConfig> {
     if s.end_pct > s.start_pct {
         bail!("end fee must not exceed start fee");
@@ -66,7 +66,7 @@ pub fn with_schedule(config: &PoolConfig, s: &FeeSchedule) -> Result<PoolConfig>
         // fee = cliff - period * r
         (cliff - end) / s.periods as u64
     } else {
-        // fee = cliff * (1 - r/10000)^period ; округляем вниз, чтобы не уйти ниже end
+        // fee = cliff * (1 - r/10000)^period ; round down so we do not go below end
         let r = 10_000.0 * (1.0 - (end as f64 / cliff as f64).powf(1.0 / s.periods as f64));
         r.floor() as u64
     };
@@ -113,20 +113,20 @@ pub enum TradeStatus {
 pub struct RunResult {
     pub trades: Vec<TradeStatus>,
     pub wallets: BTreeMap<String, WalletStats>,
-    /// комиссии в quote и в base (в зависимости от collect_fee_mode часть берётся в base)
+    /// fees in quote and in base (depending on collect_fee_mode, part is taken in base)
     pub trading_fee_quote: u128,
     pub trading_fee_base: u128,
     pub protocol_fee_quote: u128,
     pub protocol_fee_base: u128,
-    /// комиссии, пересчитанные в quote по цене после каждой сделки
+    /// fees converted to quote at the price after each trade
     pub trading_fee_equiv: f64,
     pub protocol_fee_equiv: f64,
-    /// номер сделки, на которой кривая завершилась
+    /// index of the trade on which the curve completed
     pub completed_at: Option<usize>,
     pub final_pool: PoolState,
 }
 
-/// Цена base в единицах quote (сырые единицы) по sqrt price в формате Q64.64.
+/// Price of base in quote units (raw units) from a sqrt price in Q64.64 format.
 pub fn raw_price(sqrt_price: u128) -> f64 {
     let s = sqrt_price as f64 / 18_446_744_073_709_551_616.0;
     s * s
@@ -136,14 +136,14 @@ fn point_of(config: &PoolConfig, s: &RecordedSwap) -> u64 {
     if config.activation_type == 0 { s.slot } else { s.event_timestamp }
 }
 
-/// Прогон упорядоченных реальных сделок через `config` по модели выше.
+/// Running the ordered real trades through `config` using the model above.
 pub fn run(
     config: &PoolConfig,
     mut pool: PoolState,
     ordered: &[RecordedSwap],
     created_sig: &str,
 ) -> Result<RunResult> {
-    // Реальные позиции кошельков — чтобы вычислить долю каждой продажи.
+    // Real wallet positions — to compute the share of each sell.
     let mut real_base: BTreeMap<&str, u128> = BTreeMap::new();
 
     let mut res = RunResult {
@@ -163,7 +163,7 @@ pub fn run(
         let is_buy = s.trade_direction == 1;
         let rb = real_base.entry(s.fee_payer.as_str()).or_insert(0);
         let real_before = *rb;
-        // обновляем реальную позицию по записанному результату
+        // update the real position from the recorded result
         if is_buy {
             *rb += s.result.output_amount as u128;
         } else {
@@ -180,9 +180,9 @@ pub fn run(
             continue;
         }
 
-        // Сумма сделки в симуляции.
+        // Trade amount in the simulation.
         let mut amount = s.amount_0;
-        let base_input_sell = !is_buy && s.swap_mode != 2; // продажа с заданным количеством base
+        let base_input_sell = !is_buy && s.swap_mode != 2; // sell with a fixed base amount
         if base_input_sell {
             let sold_real = s.result.included_fee_input_amount as u128;
             if real_before >= sold_real && real_before > 0 {
@@ -254,9 +254,9 @@ mod tests {
     use crate::engine::{initial_pool, PoolInit};
     use anchor_lang::prelude::Pubkey;
 
-    /// Снайперы покупают в первые периоды и продают позже. При высокой стартовой
-    /// комиссии их прибыль должна упасть, а базовый прогон — совпасть с "реальностью".
-    /// DBC_FIXTURE_CONFIG=/путь/к/fee_in_quote_config.bin
+    /// Snipers buy in the first periods and sell later. With a high starting
+    /// fee their profit should drop, and the baseline run should match "reality".
+    /// DBC_FIXTURE_CONFIG=/path/to/fee_in_quote_config.bin
     #[test]
     fn schedule_hurts_early_buyers() {
         let Ok(path) = std::env::var("DBC_FIXTURE_CONFIG") else {
@@ -266,7 +266,7 @@ mod tests {
         let raw = std::fs::read(path).unwrap();
         let size = std::mem::size_of::<PoolConfig>();
         let mut config: PoolConfig = bytemuck::pod_read_unaligned(&raw[8..8 + size]);
-        // исходный конфиг делаем плоским 0.25%, как у реального пула 28VR
+        // make the source config a flat 0.25%, like the real pool 28VR
         config.pool_fees.base_fee.cliff_fee_numerator = 2_500_000;
         config.pool_fees.base_fee.first_factor = 0;
         config.pool_fees.base_fee.second_factor = 0;
@@ -285,7 +285,7 @@ mod tests {
         let slot_mode = config.activation_type == 0;
         let at = |p: u64| if slot_mode { (p, 7u64) } else { (7u64, p) };
 
-        // (point, wallet, buy?, amount: quote для покупки / доля в % для продажи)
+        // (point, wallet, buy?, amount: quote for a buy / share in % for a sell)
         let plan: Vec<(u64, &str, bool, u64)> = vec![
             (1_000, "sniperA", true, 200_000_000),
             (1_001, "sniperB", true, 150_000_000),
@@ -331,7 +331,7 @@ mod tests {
         let pnl = |r: &RunResult, w: &str| r.wallets[w].realized();
         for w in ["sniperA", "sniperB"] {
             assert!(pnl(&alt, w) < pnl(&real, w), "{w}: cf {} !< real {}", pnl(&alt, w), pnl(&real, w));
-            // продали всё и в симуляции
+            // sold everything in the simulation too
             assert_eq!(alt.wallets[w].base, 0);
         }
         assert!(alt.trading_fee_equiv > real.trading_fee_equiv);

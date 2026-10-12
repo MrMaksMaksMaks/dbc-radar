@@ -1,4 +1,4 @@
-//! Обработчики: сообщения (команды через match) и нажатия инлайн-кнопок.
+//! Handlers: messages (commands via match) and inline button presses.
 
 use std::sync::Arc;
 
@@ -17,8 +17,8 @@ fn no_preview() -> LinkPreviewOptions {
     LinkPreviewOptions { is_disabled: true, url: None, prefer_small_media: false, prefer_large_media: false, show_above_text: false }
 }
 
-/// Отправить сообщение в MarkdownV2. Если Telegram отклонит разметку, отправить без неё,
-/// чтобы пользователь всё равно получил ответ.
+/// Send a message in MarkdownV2. If Telegram rejects the markup, send it without markup,
+/// so the user still gets a reply.
 pub async fn send(bot: &Bot, chat: ChatId, text: String, markup: Option<InlineKeyboardMarkup>) -> ResponseResult<Message> {
     let mut req = bot.send_message(chat, text.clone()).parse_mode(ParseMode::MarkdownV2).link_preview_options(no_preview());
     if let Some(m) = markup.clone() {
@@ -38,7 +38,7 @@ pub async fn send(bot: &Bot, chat: ChatId, text: String, markup: Option<InlineKe
     }
 }
 
-/// Отредактировать сообщение. «Message is not modified» (повторное нажатие) — не ошибка.
+/// Edit a message. "Message is not modified" (a repeated press) is not an error.
 pub async fn edit(bot: &Bot, chat: ChatId, id: MessageId, text: String, markup: Option<InlineKeyboardMarkup>) -> HandlerResult {
     let mut req = bot.edit_message_text(chat, id, text).parse_mode(ParseMode::MarkdownV2).link_preview_options(no_preview());
     if let Some(m) = markup {
@@ -51,7 +51,7 @@ pub async fn edit(bot: &Bot, chat: ChatId, id: MessageId, text: String, markup: 
     }
 }
 
-/// Ответ на команду или адрес: (текст, клавиатура).
+/// Reply to a command or an address: (text, keyboard).
 type View = (String, Option<InlineKeyboardMarkup>);
 
 fn err_view(e: impl std::fmt::Display) -> View {
@@ -59,7 +59,7 @@ fn err_view(e: impl std::fmt::Display) -> View {
     (esc("Something went wrong while reading the data. Please try again in a minute."), None)
 }
 
-/// Карточка пула по адресу пула или токена. None — не найдено.
+/// Pool card by pool or token address. None — not found.
 async fn pool_view(state: &State, addr: &str) -> Option<View> {
     let conn = match state.db() {
         Ok(c) => c,
@@ -92,13 +92,13 @@ fn not_found(addr: &str) -> View {
     )
 }
 
-/// Есть ли адрес в базе сборщика (как пул, токен или конфиг).
+/// Whether the address is in the collector database (as a pool, token or config).
 fn in_db(state: &State, addr: &str) -> bool {
     let Ok(conn) = state.db() else { return false };
     matches!(store::find_pool(&conn, addr), Ok(Some(_))) || matches!(store::config_exists(&conn, addr), Ok(true))
 }
 
-/// Адреса нет в базе: ищем пул через RPC, дописываем в базу и оцениваем.
+/// The address is not in the database: find the pool over RPC, append it to the database and score it.
 async fn check_onchain(bot: &Bot, chat: ChatId, state: &State, addr: &str) -> HandlerResult {
     let wait = send(bot, chat, esc("🔎 Not in our index yet — looking it up on-chain…"), None).await?;
     let view = onchain_view(state, addr).await;
@@ -109,7 +109,7 @@ async fn onchain_view(state: &State, addr: &str) -> View {
     use crate::onchain::Lookup;
     match state.rpc.resolve(addr).await {
         Ok(Lookup::Found(found)) => found_view(state, &found, addr).await,
-        // пул Meteora DAMM v2 / DLMM: проверяем его токен
+        // Meteora DAMM v2 / DLMM pool: check its token
         Ok(Lookup::MeteoraPool { venue, mint }) => {
             let note = format!("Meteora {venue} pool → token {mint}");
             let inner = if in_db(state, &mint) {
@@ -158,8 +158,8 @@ fn other_launchpad(lp: &str, by_suffix: bool) -> View {
     )
 }
 
-/// Пользователь прислал пул Meteora, а у его токена нет запуска на DBC в доступной истории:
-/// совет «пришлите пул» здесь не нужен — пул он уже прислал.
+/// The user sent a Meteora pool, but its token has no DBC launch in the available history:
+/// the "send the pool" hint is not needed here — they already sent the pool.
 fn pool_token_without_dbc_launch(venue: &str) -> View {
     (
         format!(
@@ -185,7 +185,7 @@ fn mint_without_history() -> View {
     )
 }
 
-/// Нужно ли пересчитать кэш, чтобы ответить про этот адрес (новый конфиг ещё не оценён).
+/// Whether the cache must be refreshed to answer about this address (a new config not yet scored).
 async fn needs_refresh(state: &State, addr: &str) -> bool {
     let Ok(conn) = state.db() else { return false };
     let config = match store::find_pool(&conn, addr) {
@@ -198,7 +198,7 @@ async fn needs_refresh(state: &State, addr: &str) -> bool {
     state.risk(&config).await.is_none()
 }
 
-/// Проверка адреса: пул/токен, иначе конфиг, иначе «не найдено».
+/// Address check: pool/token, otherwise config, otherwise "not found".
 async fn check(bot: &Bot, chat: ChatId, state: &State, addr: &str) -> HandlerResult {
     if !in_db(state, addr) {
         return check_onchain(bot, chat, state, addr).await;
@@ -225,7 +225,7 @@ async fn resolve(state: &State, addr: &str) -> View {
     not_found(addr)
 }
 
-/// Последние запуски с вердиктами RED / RED-LINK / AMBER за 2 часа.
+/// Latest launches with RED / RED-LINK / AMBER verdicts over 2 hours.
 async fn latest_view(state: &State) -> View {
     let rows = match state.db().and_then(|c| store::latest_pools(&c, 7200, 2000)) {
         Ok(r) => r,
@@ -255,19 +255,19 @@ async fn stats_view(state: &State) -> View {
     (render::stats(&cache.by_config, &last24, age), Some(kb::back_home()))
 }
 
-/// Входящие сообщения. Команды разбираются через match по первому слову.
+/// Incoming messages. Commands are dispatched via match on the first word.
 pub async fn handle_message(bot: Bot, msg: Message, state: Arc<State>) -> HandlerResult {
     let Some(text) = msg.text() else { return Ok(()) };
     let chat = msg.chat.id;
     let mut parts = text.trim().splitn(2, char::is_whitespace);
     let first = parts.next().unwrap_or("");
     let rest = parts.next().unwrap_or("").trim();
-    // в группах команды приходят как /check@DBC_Radar_bot
+    // in groups, commands arrive as /check@DBC_Radar_bot
     let cmd = first.split('@').next().unwrap_or(first);
 
     match cmd {
         "/start" => {
-            // ссылки из канала оповещений: /start c_<config> или /start p_<pool>
+            // links from the alerts channel: /start c_<config> or /start p_<pool>
             if let Some(cfg) = rest.strip_prefix("c_") {
                 return check(&bot, chat, &state, cfg).await;
             }
@@ -306,7 +306,7 @@ pub async fn handle_message(bot: Bot, msg: Message, state: Arc<State>) -> Handle
     Ok(())
 }
 
-/// Нажатия инлайн-кнопок: сообщение редактируется на месте.
+/// Inline button presses: the message is edited in place.
 pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<State>) -> HandlerResult {
     bot.answer_callback_query(q.id.clone()).await?;
     let (Some(data), Some(message)) = (q.data.as_deref(), q.message.as_ref()) else { return Ok(()) };

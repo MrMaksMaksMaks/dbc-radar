@@ -1,5 +1,5 @@
-//! Сбор свопов: по кругу опрашиваем подписи каждого отслеживаемого пула,
-//! начиная с последней обработанной, и разбираем новые транзакции от старых к новым.
+//! Swap collection: in a loop we poll the signatures of every tracked pool,
+//! starting from the last processed one, and parse new transactions from oldest to newest.
 
 use crate::app::App;
 use futures_util::StreamExt;
@@ -12,16 +12,16 @@ use std::time::Duration;
 const PAGE: usize = 1000;
 const WARN_BACKLOG: usize = 5000;
 
-/// Сколько транзакций одного пула обрабатывать за круг: тяжёлый пул не должен
-/// задерживать остальные, недообработанное продолжится на следующем круге.
+/// How many transactions of one pool to process per round: a heavy pool must not
+/// hold up the others; the unprocessed rest continues in the next round.
 const MAX_TX_PER_POOL_ROUND: usize = 150;
-/// Сколько транзакций запрашивать одновременно.
+/// How many transactions to request concurrently.
 const FETCH_CONCURRENCY: usize = 8;
-/// После стольких записанных свопов пул больше не опрашивается.
+/// After this many recorded swaps the pool is no longer polled.
 const MAX_SWAPS_PER_POOL: i64 = 500;
-/// Транзакцию моложе этого возраста (с) ждём на основном узле: она может быть ещё не проиндексирована.
-/// Старше — основной узел её, скорее всего, уже не отдаст (короткая история): берём из запасного RPC
-/// или пропускаем, чтобы пул не застрял до конца окна отслеживания.
+/// A transaction younger than this age (s) is awaited on the main node: it may not be indexed yet.
+/// Older — the main node most likely will not serve it anymore (short history): take it from the backup RPC
+/// or skip it, so the pool does not get stuck until the end of the tracking window.
 const FRESH_TX_SECS: i64 = 120;
 
 pub async fn run(app: Arc<App>) {
@@ -50,12 +50,12 @@ pub async fn run(app: Arc<App>) {
 }
 
 async fn poll_pool(app: &App, pool: &str, last_sig: Option<&str>) -> Result<()> {
-    // Собираем все подписи новее last_sig (RPC отдаёт новые первыми).
+    // Collect all signatures newer than last_sig (RPC returns the newest first).
     let new_sigs = match collect_new(app, pool, last_sig).await {
         Ok(v) => v,
-        // Узел RPC не знает подпись `until` (код -32020: другой бэкенд за балансировщиком,
-        // отставание индекса или транзакция выпала из форка). Тогда идём без `until`
-        // и обрезаем список сами, на нашей стороне.
+        // The RPC node does not know the `until` signature (code -32020: a different backend behind the load balancer,
+        // index lag, or the transaction dropped out of a fork). Then we go without `until`
+        // and trim the list ourselves, on our side.
         Err(e) if last_sig.is_some() && format!("{e:#}").contains("-32020") => {
             tracing::debug!(%pool, "until-signature unknown to RPC, falling back: {e:#}");
             collect_without_until(app, pool, last_sig.unwrap()).await?
@@ -66,10 +66,10 @@ async fn poll_pool(app: &App, pool: &str, last_sig: Option<&str>) -> Result<()> 
         tracing::warn!(%pool, n = new_sigs.len(), "large backlog for pool");
     }
 
-    // Транзакции забираем параллельно (до FETCH_CONCURRENCY запросов сразу; общий лимит
-    // RPC_RPS соблюдается ограничителем в Rpc), а записываем строго от старых к новым:
-    // `buffered` сохраняет порядок. last_sig двигаем только после успешной обработки,
-    // поэтому при сбое следующий круг продолжит с того же места.
+    // Transactions are fetched in parallel (up to FETCH_CONCURRENCY requests at once; the overall
+    // RPC_RPS limit is enforced by the limiter in Rpc), but written strictly from oldest to newest:
+    // `buffered` preserves the order. last_sig only moves after successful processing,
+    // so after a failure the next round continues from the same place.
     let batch: Vec<&SigInfo> = new_sigs.iter().rev().take(MAX_TX_PER_POOL_ROUND).collect();
     let futs: Vec<_> = batch.iter().map(|s| fetch_tx(&app.rpc, s.signature.clone(), s.failed)).collect();
     let mut fetched = futures_util::stream::iter(futs).buffered(FETCH_CONCURRENCY);
@@ -79,7 +79,7 @@ async fn poll_pool(app: &App, pool: &str, last_sig: Option<&str>) -> Result<()> 
         let s = batch[i];
         i += 1;
         match res? {
-            // неуспешная транзакция: событий нет, просто сдвигаем курсор
+            // failed transaction: no events, just move the cursor
             None => {}
             Some(Some(raw)) => {
                 let parsed = parse_tx(&raw)?;
@@ -105,8 +105,8 @@ async fn poll_pool(app: &App, pool: &str, last_sig: Option<&str>) -> Result<()> 
         app.db.set_last_sig(pool, &s.signature)?;
     }
 
-    // Для наших признаков нужен этап кривой; пулы, которые торгуются часами без graduation,
-    // не должны съедать лимит RPC.
+    // Our signals need the curve stage; pools that trade for hours without graduation
+    // must not eat up the RPC limit.
     if app.db.swap_count(pool)? >= MAX_SWAPS_PER_POOL {
         app.db.mark_done(pool, "swap_cap")?;
         tracing::debug!(%pool, "stopped tracking: swap cap reached");
@@ -129,10 +129,10 @@ async fn collect_new(app: &App, pool: &str, last_sig: Option<&str>) -> Result<Ve
     Ok(out)
 }
 
-/// Страницы подписей без `until`, пока не встретится `last_sig` (не включая его).
-/// Если подпись так и не нашлась за MAX_FALLBACK_PAGES страниц, возвращаем всё собранное:
-/// повторные сделки отсекаются INSERT OR IGNORE, а last_sig сдвинется на свежую подпись,
-/// которую RPC уже знает.
+/// Pages of signatures without `until`, until `last_sig` is met (not including it).
+/// If the signature is not found within MAX_FALLBACK_PAGES pages, return everything collected:
+/// repeated trades are dropped by INSERT OR IGNORE, and last_sig moves to a fresh signature
+/// that the RPC already knows.
 async fn collect_without_until(app: &App, pool: &str, last_sig: &str) -> Result<Vec<SigInfo>> {
     const MAX_FALLBACK_PAGES: usize = 5;
     let mut out: Vec<SigInfo> = Vec::new();
@@ -161,8 +161,8 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Транзакция из запасного RPC в пределах часового бюджета; None — нет запасного RPC, бюджет исчерпан
-/// или запасной узел её тоже не отдал.
+/// Transaction from the backup RPC within the hourly budget; None — no backup RPC, the budget is spent
+/// or the backup node did not serve it either.
 async fn fetch_backup(app: &App, sig: &str) -> Option<serde_json::Value> {
     let rpc = app.backup_rpc.as_ref()?;
     if !app.take_backup_budget() {
@@ -178,7 +178,7 @@ async fn fetch_backup(app: &App, sig: &str) -> Option<serde_json::Value> {
     }
 }
 
-/// None — транзакция неуспешна (событий нет); Some(None) — RPC её ещё не отдаёт.
+/// None — the transaction failed (no events); Some(None) — the RPC does not serve it yet.
 async fn fetch_tx(rpc: &crate::rpc::Rpc, sig: String, failed: bool) -> Result<Option<Option<serde_json::Value>>> {
     if failed {
         return Ok(None);

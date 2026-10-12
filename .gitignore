@@ -7,7 +7,7 @@ risk.json
 research/
 *:Zone.Identifier
 bot_alerted.txt
-# исследовательские скрипты живут только на сервере
+# research scripts live only on the server
 tools/
 *.patch
 out/

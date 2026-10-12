@@ -1,5 +1,5 @@
-//! Хранилище SQLite. u64-суммы пишем как INTEGER (влезают в i64 для реальных объёмов),
-//! u128 (sqrt price) — как TEXT, чтобы не терять точность.
+//! SQLite storage. u64 amounts are written as INTEGER (they fit in i64 for real volumes),
+//! u128 (sqrt price) as TEXT, so no precision is lost.
 
 use crate::events::{CurveComplete, InitPool, Swap2};
 use anyhow::Result;
@@ -25,9 +25,9 @@ CREATE TABLE IF NOT EXISTS pools (
     created_sig      TEXT NOT NULL,
     created_slot     INTEGER NOT NULL,
     created_time     INTEGER,           -- unix, blockTime
-    discovered_at    INTEGER NOT NULL,  -- unix, когда мы его увидели
-    tracked          INTEGER NOT NULL,  -- 1 = собираем свопы
-    last_sig         TEXT,              -- последняя обработанная подпись
+    discovered_at    INTEGER NOT NULL,  -- unix, when we saw it
+    tracked          INTEGER NOT NULL,  -- 1 = we collect swaps
+    last_sig         TEXT,              -- last processed signature
     done             INTEGER NOT NULL DEFAULT 0,
     done_reason      TEXT
 );
@@ -59,8 +59,8 @@ CREATE TABLE IF NOT EXISTS swaps (
     migration_threshold       INTEGER NOT NULL,
     event_timestamp           INTEGER NOT NULL,
     transfer_hook             INTEGER NOT NULL,
-    sol_owner                 TEXT,              -- чьи SOL: плательщик при покупке, получатель при продаже
-    token_owner               TEXT,              -- кто получил (покупка) или отдал (продажа) токены
+    sol_owner                 TEXT,              -- whose SOL: the payer on a buy, the receiver on a sell
+    token_owner               TEXT,              -- who received (buy) or gave away (sell) the tokens
     PRIMARY KEY (signature, event_index)
 );
 CREATE INDEX IF NOT EXISTS swaps_pool_slot ON swaps(pool, slot);
@@ -77,7 +77,7 @@ CREATE TABLE IF NOT EXISTS curve_complete (
     quote_reserve INTEGER NOT NULL
 );
 
--- Откуда пришла каждая подпись: ws:0, ws:1, watch — для оценки полноты обнаружения.
+-- Where each signature came from: ws:0, ws:1, watch — to measure discovery completeness.
 CREATE TABLE IF NOT EXISTS discovery (
     signature TEXT NOT NULL,
     source    TEXT NOT NULL,
@@ -85,8 +85,8 @@ CREATE TABLE IF NOT EXISTS discovery (
     PRIMARY KEY (signature, source)
 );
 
--- Сырые данные аккаунта PoolConfig: декодировать полностью позже (SDK/IDL),
--- quote_mint и fee_claimer вынимаем сразу.
+-- Raw PoolConfig account data: to be fully decoded later (SDK/IDL),
+-- quote_mint and fee_claimer are extracted right away.
 CREATE TABLE IF NOT EXISTS configs (
     config      TEXT PRIMARY KEY,
     quote_mint  TEXT,
@@ -97,7 +97,7 @@ CREATE TABLE IF NOT EXISTS configs (
 "#;
 
 fn i(v: u64) -> i64 {
-    // Реальные суммы далеко от 2^63; насыщение лучше молчаливого переполнения.
+    // Real amounts are far from 2^63; saturation is better than a silent overflow.
     i64::try_from(v).unwrap_or(i64::MAX)
 }
 
@@ -112,7 +112,7 @@ impl Db {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
-        // миграция базы, созданной до появления колонок фактических сторон сделки
+        // migration of a database created before the columns for the actual trade parties existed
         for col in ["sol_owner", "token_owner"] {
             let exists = conn
                 .prepare("SELECT 1 FROM pragma_table_info('swaps') WHERE name = ?1")?
@@ -124,7 +124,7 @@ impl Db {
         Ok(Self { conn: Mutex::new(conn) })
     }
 
-    /// Возвращает true, если пул новый.
+    /// Returns true if the pool is new.
     pub fn insert_pool(
         &self,
         p: &InitPool,
@@ -195,8 +195,8 @@ impl Db {
         Ok(())
     }
 
-    /// Graduation по состоянию аккаунта пула (подпись "account", слот 0).
-    /// Пул не закрывается: poller продолжает догружать его свопы. true — запись добавлена.
+    /// Graduation from the pool account state (signature "account", slot 0).
+    /// The pool is not closed: the poller keeps loading its swaps. true — the record was added.
     pub fn insert_curve_from_account(
         &self,
         pool: &str,
@@ -212,7 +212,7 @@ impl Db {
         Ok(n > 0)
     }
 
-    /// Пулы (отслеживаемые и нет) без записи о graduation, созданные не раньше `since`: (pool, config).
+    /// Pools (tracked or not) without a graduation record, created no earlier than `since`: (pool, config).
     pub fn pools_without_graduation(&self, since: i64) -> Result<Vec<(String, String)>> {
         let conn = self.conn.lock().unwrap();
         let mut st = conn.prepare(
@@ -259,7 +259,7 @@ impl Db {
         Ok(())
     }
 
-    /// Закрывает отслеживание пулов старше окна. Возвращает число закрытых.
+    /// Closes tracking of pools older than the window. Returns the number closed.
     pub fn expire_pools(&self, track_secs: i64) -> Result<usize> {
         Ok(self.conn.lock().unwrap().execute(
             "UPDATE pools SET done = 1, done_reason = 'window_expired'
@@ -269,7 +269,7 @@ impl Db {
         )?)
     }
 
-    /// Активные пулы: (pool, last_sig).
+    /// Active pools: (pool, last_sig).
     pub fn active_pools(&self) -> Result<Vec<(String, Option<String>)>> {
         let conn = self.conn.lock().unwrap();
         let mut st = conn.prepare(
@@ -305,7 +305,7 @@ impl Db {
     }
 
     pub fn insert_config(&self, config: &str, raw: Option<&[u8]>) -> Result<()> {
-        // PoolConfig (bytemuck, repr C): [0..8] дискриминатор, [8..40] quote_mint, [40..72] fee_claimer
+        // PoolConfig (bytemuck, repr C): [0..8] discriminator, [8..40] quote_mint, [40..72] fee_claimer
         let key = |a: usize| {
             raw.filter(|d| d.len() >= a + 32)
                 .map(|d| bs58::encode(&d[a..a + 32]).into_string())

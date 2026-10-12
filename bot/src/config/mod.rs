@@ -5,28 +5,28 @@ use std::env;
 pub struct Config {
     pub telegram_token: String,
     pub bot_username: String,
-    /// база сборщика (бот читает её и дописывает пулы, найденные по запросу через RPC)
+    /// collector database (the bot reads it and appends pools it found on request over RPC)
     pub db_path: String,
-    /// HTTP RPC для проверки адресов, которых нет в базе
+    /// HTTP RPC for checking addresses that are not in the database
     pub rpc_url: String,
-    /// узел с полной историей транзакций (например, Helius) — только для поиска пула по адресу
-    /// токена; пусто — используется RPC_URL
+    /// node with full transaction history (e.g. Helius) — only for finding a pool by token
+    /// address; empty — RPC_URL is used
     pub history_rpc_url: Option<String>,
-    /// бинарник dbc-replay: из него берётся оценка всех конфигов (`risk --json`)
+    /// dbc-replay binary: the scores of all configs come from it (`risk --json`)
     pub replay_bin: String,
-    /// как часто пересчитывать оценку конфигов, секунды
+    /// how often to re-score configs, seconds
     pub refresh_secs: u64,
-    /// канал или чат для оповещений (числовой id или @username); пусто — без оповещений
+    /// channel or chat for alerts (numeric id or @username); empty — no alerts
     pub alert_chat: Option<String>,
-    /// как часто публиковать сводку в канал, секунды
+    /// how often to post a summary to the channel, seconds
     pub digest_secs: u64,
-    /// файл со списком конфигов, о которых уже было оповещение
+    /// file with the list of configs that have already been alerted
     pub alerted_file: String,
-    /// адрес HTTP API (например 127.0.0.1:8080); пусто — API выключен
+    /// HTTP API address (e.g. 127.0.0.1:8080); empty — API disabled
     pub api_bind: Option<String>,
-    /// ключи API: с ключом разрешён поиск неизвестных адресов через RPC и выше лимит
+    /// API keys: a key allows looking up unknown addresses over RPC and a higher limit
     pub api_keys: Vec<String>,
-    /// запросов в минуту с одного IP без ключа / с ключом
+    /// requests per minute per IP without a key / with a key
     pub api_rate_public: u32,
     pub api_rate_key: u32,
 }

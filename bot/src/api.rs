@@ -1,19 +1,19 @@
-//! Публичный HTTP API для терминалов, ботов и лаунчпадов: те же вердикты, что в боте, в JSON.
+//! Public HTTP API for terminals, bots and launchpads: the same verdicts as the bot, in JSON.
 //!
-//!   GET /v1/health                    — состояние сервиса
-//!   GET /v1/check/{address}           — токен, пул DBC, конфиг или пул Meteora DAMM v2 / DLMM
-//!   GET /v1/latest?hours=2&limit=20   — последние запуски с вердиктами RED / RED-LINK / AMBER
-//!   GET /v1/stats                     — запуски за 24 часа по вердиктам
+//!   GET /v1/health                    — service status
+//!   GET /v1/check/{address}           — token, DBC pool, config, or Meteora DAMM v2 / DLMM pool
+//!   GET /v1/latest?hours=2&limit=20   — latest launches with RED / RED-LINK / AMBER verdicts
+//!   GET /v1/stats                     — launches in the last 24 hours by verdict
 //!
-//! Адреса из базы отдаются всем. Без ключа также работает дешёвая проверка по одному аккаунту:
-//! адрес пула DAMM v2 / DLMM определяется в токен, и если токен есть в базе — отдаётся его вердикт.
-//! Поиск неизвестных пулов и токенов через RPC (включая историю транзакций) расходует лимиты
-//! провайдеров, поэтому доступен только с ключом (заголовок `X-API-Key`).
-//! Без ключа из ответа /v1/check убираются адреса создателя и получателей
+//! Addresses already in the database are served to everyone. Without a key, a cheap single-account check also works:
+//! a DAMM v2 / DLMM pool address resolves to its token, and if the token is in the database, its verdict is returned.
+//! Looking up unknown pools and tokens over RPC (including transaction history) uses provider
+//! quotas, so it is available only with a key (header `X-API-Key`).
+//! Without a key, /v1/check responses omit the creator and receiver addresses
 //! (launch.creator, config.top_creator, config.fee_claimer, config.leftover_receiver).
-//! Неверный ключ — ответ 401.
-//! Лимит запросов — на IP в минуту. За Cloudflare берётся заголовок CF-Connecting-IP,
-//! но только если соединение пришло с loopback (от локального cloudflared).
+//! Invalid key — 401 response.
+//! Rate limit is per IP per minute. Behind Cloudflare the CF-Connecting-IP header is used,
+//! but only if the connection came from loopback (from the local cloudflared).
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -69,12 +69,12 @@ fn err(status: StatusCode, code: &str, message: &str) -> Response {
     (status, Json(json!({"error": code, "message": message}))).into_response()
 }
 
-/// Проверка лимита и ключа. Ok(true) — валидный ключ, Ok(false) — без ключа;
-/// Err — ответ 429 (лимит превышен) или 401 (неверный ключ).
+/// Rate-limit and key check. Ok(true) — valid key, Ok(false) — no key;
+/// Err — a 429 (rate limit exceeded) or 401 (invalid key) response.
 async fn admit(api: &Api, headers: &HeaderMap, peer: SocketAddr) -> Result<bool, Response> {
     let key = headers.get("x-api-key").and_then(|v| v.to_str().ok());
     let key_ok = key.map(|k| api.keys.contains(k)).unwrap_or(false);
-    // CF-Connecting-IP доверяем только от локального cloudflared, иначе заголовок можно подделать
+    // CF-Connecting-IP is trusted only from the local cloudflared, otherwise the header can be spoofed
     let client = if peer.ip().is_loopback() {
         headers
             .get("cf-connecting-ip")
@@ -104,15 +104,15 @@ async fn admit(api: &Api, headers: &HeaderMap, peer: SocketAddr) -> Result<bool,
             ));
         }
     }
-    // неверный ключ проверяется после лимита, чтобы перебор ключей тоже ограничивался
+    // an invalid key is checked after the rate limit, so key brute-forcing is rate-limited too
     if key.is_some() && !key_ok {
         return Err(err(StatusCode::UNAUTHORIZED, "invalid_api_key", "X-API-Key is not valid"));
     }
     Ok(key_ok)
 }
 
-/// Без ключа скрываем адреса создателя и получателей:
-/// публичны вердикт, флаги и проценты, адреса операторов — только по ключу.
+/// Without a key we hide the creator and receiver addresses:
+/// the verdict, flags and percentages are public; operator addresses only with a key.
 fn redact(v: &mut Value) {
     if let Some(c) = v.get_mut("config").and_then(Value::as_object_mut) {
         for k in ["top_creator", "fee_claimer", "leftover_receiver"] {
@@ -152,7 +152,7 @@ fn pool_json(p: &store::PoolInfo) -> Value {
     })
 }
 
-/// Вердикт конфига из кэша (при необходимости кэш пересчитывается).
+/// Config verdict from the cache (the cache is refreshed if needed).
 async fn config_json(app: &State, config: &str) -> Option<Value> {
     if app.risk(config).await.is_none() {
         if let Err(e) = app.refresh().await {
@@ -162,7 +162,7 @@ async fn config_json(app: &State, config: &str) -> Option<Value> {
     app.risk(config).await.map(|r| r.0)
 }
 
-/// Ответ по адресу, который уже есть в базе (пул, токен или конфиг).
+/// Response for an address already in the database (pool, token or config).
 async fn from_db(app: &State, addr: &str) -> Option<Value> {
     let conn = app.db().ok()?;
     if let Ok(Some(p)) = store::find_pool(&conn, addr) {
@@ -181,7 +181,7 @@ async fn from_db(app: &State, addr: &str) -> Option<Value> {
     None
 }
 
-/// Токен (не пул Meteora): из базы, иначе через RPC.
+/// Token (not a Meteora pool): from the database, otherwise over RPC.
 async fn token_json(app: &State, mint: &str) -> Value {
     if let Some(v) = from_db(app, mint).await {
         return v;
@@ -206,8 +206,8 @@ async fn found_json(app: &State, f: &onchain::FoundPool) -> Value {
     from_db(app, &f.pool).await.unwrap_or(json!({"kind": "unknown", "error": "not_found"}))
 }
 
-/// Проверка без ключа для адреса, которого нет в базе: только один getAccountInfo.
-/// Пул DAMM v2 / DLMM → его токен → вердикт из базы (если токен там есть).
+/// Keyless check for an address not in the database: a single getAccountInfo only.
+/// DAMM v2 / DLMM pool → its token → verdict from the database (if the token is there).
 async fn public_lookup(api: &Api, addr: &str) -> Response {
     match api.app.rpc.resolve_cheap(addr).await {
         Ok(Some(Lookup::MeteoraPool { venue, mint })) => {
@@ -231,13 +231,13 @@ async fn public_lookup(api: &Api, addr: &str) -> Response {
             )
         }
         Ok(Some(Lookup::NotDbc)) => err(StatusCode::NOT_FOUND, "not_dbc", "not a Meteora DBC pool, token or config"),
-        // токен: поиск его пула по истории — только с ключом; лаунчпад по окончанию адреса — бесплатно
+        // token: finding its pool through history needs a key; the launchpad by address suffix is free
         Ok(None) => match onchain::launchpad_by_suffix(addr) {
             Some(lp) => Json(json!({"kind": "token", "dbc": false, "launchpad": lp, "inferred_from_address": true}))
                 .into_response(),
             None => err(StatusCode::NOT_FOUND, "not_indexed", NOT_INDEXED),
         },
-        // пул DBC, которого нет в базе: запись в базу — только с ключом
+        // DBC pool not in the database: writing it to the database needs a key
         Ok(Some(_)) => err(StatusCode::NOT_FOUND, "not_indexed", NOT_INDEXED),
         Err(e) => err(StatusCode::BAD_GATEWAY, "rpc_error", &e.to_string()),
     }
@@ -265,7 +265,7 @@ async fn check(
     if !key_ok {
         return public_lookup(&api, &addr).await;
     }
-    // дальше только запросы с валидным ключом: полный поиск, адреса не скрываются
+    // from here on, only requests with a valid key: full lookup, addresses are not hidden
     let v = match api.app.rpc.resolve(&addr).await {
         Ok(Lookup::Found(f)) => found_json(&api.app, &f).await,
         Ok(Lookup::MeteoraPool { venue, mint }) => {

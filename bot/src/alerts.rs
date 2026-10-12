@@ -1,5 +1,5 @@
-//! Фоновые задачи: пересчёт оценок по таймеру, оповещения о новых рискованных конфигах
-//! и периодическая сводка в канал.
+//! Background tasks: timed re-scoring, alerts about new risky configs
+//! and a periodic summary to the channel.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use crate::store::{self, now, State};
 use crate::{handlers, keyboards as kb};
 
 const ALERT_VERDICTS: &[&str] = &["RED", "RED-LINK", "AMBER"];
-/// Не больше стольких оповещений за один пересчёт, чтобы не заваливать канал.
+/// At most this many alerts per re-score, so the channel is not flooded.
 const MAX_ALERTS_PER_ROUND: usize = 5;
 
 fn recipient(s: &str) -> Recipient {
@@ -37,12 +37,12 @@ fn save_alerted(path: &str, set: &HashSet<String>) {
     }
 }
 
-/// Пересчёт кэша по таймеру и оповещения о новых конфигах после каждого пересчёта.
+/// Timed cache refresh, and alerts about new configs after every refresh.
 pub async fn run_refresher(bot: Bot, state: Arc<State>) {
     let mut alerted = load_alerted(&state.cfg.alerted_file);
     let mut first = true;
     loop {
-        // первый пересчёт уже сделан при старте, поэтому на первом круге пересчёт пропускаем
+        // the first refresh already ran at startup, so the first loop iteration skips it
         let res = if first { Ok(()) } else { state.refresh().await };
         first = false;
         if let Err(e) = res {
@@ -57,7 +57,7 @@ pub async fn run_refresher(bot: Bot, state: Arc<State>) {
                 .collect();
             drop(cache);
             match alerted.as_mut() {
-                // первый запуск: всё уже известное считается «оповещённым», чтобы не было лавины
+                // first run: everything already known counts as "alerted", to avoid a flood
                 None => {
                     let set: HashSet<String> = risky.iter().map(|(c, _)| c.clone()).collect();
                     save_alerted(&state.cfg.alerted_file, &set);
@@ -104,7 +104,7 @@ pub async fn run_refresher(bot: Bot, state: Arc<State>) {
     }
 }
 
-/// Сводка за период в канал оповещений.
+/// Summary for a period, posted to the alerts channel.
 pub async fn run_digest(bot: Bot, state: Arc<State>) {
     let Some(chat) = state.cfg.alert_chat.clone() else { return };
     let period = state.cfg.digest_secs.max(600);
@@ -126,7 +126,7 @@ pub async fn run_digest(bot: Bot, state: Arc<State>) {
         let chat_id = match chat.parse::<i64>() {
             Ok(id) => ChatId(id),
             Err(_) => {
-                // для @username используем отдельный запрос без helper-а
+                // for @username we use a separate request without the helper
                 let _ = bot
                     .send_message(Recipient::ChannelUsername(chat.clone()), text)
                     .parse_mode(teloxide::types::ParseMode::MarkdownV2)

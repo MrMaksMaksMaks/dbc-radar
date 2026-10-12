@@ -1,17 +1,17 @@
-//! Декодирование событий DBC, которые программа эмитит через Anchor event CPI.
+//! Decoding DBC events that the program emits via Anchor event CPI.
 //!
-//! Данные внутренней инструкции event CPI устроены так:
-//!   [8 байт EVENT_IX_TAG] [8 байт дискриминатора события] [borsh-payload]
+//! The event CPI inner instruction data is laid out like this:
+//!   [8 bytes EVENT_IX_TAG] [8 bytes event discriminator] [borsh payload]
 //!
-//! Раскладки структур и дискриминаторы взяты из IDL dynamic_bonding_curve v0.2.1
+//! Struct layouts and discriminators are taken from the dynamic_bonding_curve v0.2.1 IDL
 //! (MeteoraAg/dynamic-bonding-curve-sdk, src/idl/dynamic-bonding-curve/idl.json).
-//! При обновлении программы сверяйте их с актуальным IDL.
+//! When the program is updated, check them against the current IDL.
 
 use anyhow::{bail, Result};
 
 pub const DBC_PROGRAM_ID: &str = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN";
 
-/// Anchor EVENT_IX_TAG (0x1d9acb512ea545e4) в little-endian.
+/// Anchor EVENT_IX_TAG (0x1d9acb512ea545e4) in little-endian.
 pub const EVENT_IX_TAG: [u8; 8] = [0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x9a, 0x1d];
 
 const D_INIT_POOL: [u8; 8] = [228, 50, 246, 85, 203, 66, 134, 37];
@@ -36,7 +36,7 @@ pub struct InitPool {
 pub struct Swap2 {
     pub pool: String,
     pub config: String,
-    /// 0 = base -> quote (продажа), 1 = quote -> base (покупка)
+    /// 0 = base -> quote (sell), 1 = quote -> base (buy)
     pub trade_direction: u8,
     pub has_referral: bool,
     pub amount_0: u64,
@@ -72,8 +72,8 @@ pub enum DbcEvent {
     CurveComplete(CurveComplete),
 }
 
-/// Пробует декодировать данные внутренней инструкции как событие DBC.
-/// Возвращает Ok(None) для событий, которые нам не нужны (claims, metadata и т.д.).
+/// Tries to decode inner instruction data as a DBC event.
+/// Returns Ok(None) for events we do not need (claims, metadata, etc.).
 pub fn decode_event_ix(data: &[u8]) -> Result<Option<DbcEvent>> {
     if data.len() < 16 || data[..8] != EVENT_IX_TAG {
         return Ok(None);
@@ -109,7 +109,7 @@ pub fn decode_event_ix(data: &[u8]) -> Result<Option<DbcEvent>> {
             trading_fee: r.u64()?,
             protocol_fee: r.u64()?,
             referral_fee: r.u64()?,
-            // хвост EvtSwap2
+            // tail of EvtSwap2
             quote_reserve_amount: r.u64()?,
             migration_threshold: r.u64()?,
             current_timestamp: r.u64()?,
@@ -126,7 +126,7 @@ pub fn decode_event_ix(data: &[u8]) -> Result<Option<DbcEvent>> {
     Ok(Some(ev))
 }
 
-/// Минимальный borsh-ридер (little-endian, без выравнивания).
+/// Minimal borsh reader (little-endian, no alignment).
 struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,

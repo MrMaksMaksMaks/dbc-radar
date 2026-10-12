@@ -1,8 +1,8 @@
-//! Экранирование MarkdownV2 в одном месте (как в Starter Kit Bot): все динамические данные
-//! и статический текст сообщений проходят через эти функции, чтобы набор спецсимволов
-//! не разошёлся между модулями.
+//! MarkdownV2 escaping in one place (as in Starter Kit Bot): all dynamic data
+//! and static message text go through these functions, so the set of special characters
+//! does not drift between modules.
 
-/// Экранирует спецсимволы MarkdownV2 в обычном тексте.
+/// Escapes MarkdownV2 special characters in plain text.
 pub fn escape_markdown_v2(text: &str) -> String {
     const SPECIAL: &[char] = &[
         '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=',
@@ -18,12 +18,12 @@ pub fn escape_markdown_v2(text: &str) -> String {
     escaped
 }
 
-/// Короткое имя функции для частого использования в шаблонах.
+/// Short function name for frequent use in templates.
 pub fn esc(text: &str) -> String {
     escape_markdown_v2(text)
 }
 
-/// Моноширинный фрагмент (адреса): внутри `...` экранируются только ` и \.
+/// Monospace fragment (addresses): inside `...` only ` and \ are escaped.
 pub fn code(text: &str) -> String {
     let inner: String = text
         .chars()
@@ -32,17 +32,17 @@ pub fn code(text: &str) -> String {
     format!("`{inner}`")
 }
 
-/// Жирный текст.
+/// Bold text.
 pub fn bold(text: &str) -> String {
     format!("*{}*", esc(text))
 }
 
-/// Курсив.
+/// Italic.
 pub fn italic(text: &str) -> String {
     format!("_{}_", esc(text))
 }
 
-/// Ссылка: в URL экранируются только ) и \.
+/// Link: in the URL only ) and \ are escaped.
 pub fn link(text: &str, url: &str) -> String {
     let u: String = url
         .chars()

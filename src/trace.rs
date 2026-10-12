@@ -1,14 +1,14 @@
 //! `dbc-collector trace <pool prefix> [--csv solscan_export.csv]`
 //!
-//! Собирает цепочку доказательств по одному пулу в Markdown со ссылками на Solscan:
-//!   1. запуск и стартовая покупка создателя (из базы);
-//!   2. откуда у «продавцов извне» взялись токены: для каждого такого кошелька
-//!      ищется последняя транзакция перед его первой продажей, в которой его баланс
-//!      токена пула вырос, и определяется, с какого адреса токены ушли (RPC);
-//!   3. продажи этих кошельков обратно в пул (из базы);
-//!   4. graduation (из базы);
-//!   5. выход создателя после миграции: вывод остатка, снятие ликвидности, продажа
-//!      (из CSV-выгрузки Solscan «DeFi Activities» кошелька создателя, если передана).
+//! Builds a chain of evidence for one pool in Markdown with Solscan links:
+//!   1. the launch and the creator's opening buy (from the database);
+//!   2. where the "outside sellers" got their tokens: for each such wallet
+//!      we look for the last transaction before its first sell in which its balance
+//!      of the pool token grew, and determine which address the tokens came from (RPC);
+//!   3. these wallets' sells back into the pool (from the database);
+//!   4. graduation (from the database);
+//!   5. the creator's exit after migration: leftover withdrawal, liquidity removal, selling
+//!      (from the Solscan "DeFi Activities" CSV export of the creator's wallet, if provided).
 
 use crate::events::DBC_PROGRAM_ID;
 use crate::rpc::Rpc;
@@ -17,7 +17,7 @@ use rusqlite::{params, Connection, OpenFlags};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 
-/// Сколько подписей кошелька просматривать назад от его первой продажи.
+/// How many of the wallet's signatures to look back from its first sell.
 const LOOKBACK: usize = 100;
 
 fn tx_link(sig: &str) -> String {
@@ -43,7 +43,7 @@ struct Sell {
     sol: u64,
 }
 
-/// Изменение баланса токена `mint` по владельцам в одной транзакции (post − pre).
+/// Change of the `mint` token balance per owner within one transaction (post − pre).
 fn token_deltas(tx: &Value, mint: &str) -> HashMap<String, i128> {
     let mut out: HashMap<String, i128> = HashMap::new();
     let mut add = |arr: Option<&Value>, sign: i128| {
@@ -85,7 +85,7 @@ struct Inflow {
     sources: Vec<String>,
 }
 
-/// Последний входящий перевод токена `mint` на кошелёк перед подписью `before`.
+/// The last incoming transfer of the `mint` token to the wallet before the `before` signature.
 async fn find_inflow(rpc: &Rpc, wallet: &str, mint: &str, before: &str) -> Result<Option<Inflow>> {
     let sigs = rpc.get_signatures(wallet, None, Some(before), LOOKBACK).await?;
     for s in sigs {
@@ -94,7 +94,7 @@ async fn find_inflow(rpc: &Rpc, wallet: &str, mint: &str, before: &str) -> Resul
         }
         let Some(tx) = rpc.get_transaction(&s.signature).await? else { continue };
         if touches_program(&tx, DBC_PROGRAM_ID) {
-            continue; // это своп в DBC, не перевод
+            continue; // this is a DBC swap, not a transfer
         }
         let d = token_deltas(&tx, mint);
         let got = d.get(wallet).copied().unwrap_or(0);
@@ -119,7 +119,7 @@ fn rel(t: Option<i64>, t0: Option<i64>) -> String {
     }
 }
 
-/// Строки CSV-выгрузки Solscan «DeFi Activities», относящиеся к токену.
+/// Rows of the Solscan "DeFi Activities" CSV export that relate to the token.
 fn csv_exit_rows(path: &str, mint: &str) -> Result<Vec<Vec<String>>> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {path}"))?;
     let mut rows = Vec::new();
@@ -154,7 +154,7 @@ pub async fn run(rpc: &Rpc, db_path: &str, prefix: &str, csv: Option<&str>) -> R
         0 => bail!("no pool starting with {prefix}"),
         n => bail!("{n} pools start with {prefix}, use a longer prefix"),
     };
-    let dec: u32 = 6; // токены DBC в наших данных — 6 знаков; уточняется ниже по конфигу, если есть
+    let dec: u32 = 6; // DBC tokens in our data have 6 decimals; refined below from the config, if available
     let t0 = p.created_time;
 
     println!("# Evidence trace: pool {}\n", p.pool);
@@ -163,7 +163,7 @@ pub async fn run(rpc: &Rpc, db_path: &str, prefix: &str, csv: Option<&str>) -> R
     println!("- creator: {}", addr_link(&p.creator));
     println!("- pool created: {} ({})\n", tx_link(&p.created_sig), t0.map(|t| t.to_string()).unwrap_or("?".into()));
 
-    // 1. Покупки создателя
+    // 1. Creator's buys
     println!("## 1. Creator's opening buy\n");
     let mut st = conn.prepare(
         "SELECT signature, block_time, included_fee_input_amount, output_amount FROM swaps
@@ -190,7 +190,7 @@ pub async fn run(rpc: &Rpc, db_path: &str, prefix: &str, csv: Option<&str>) -> R
     }
     println!();
 
-    // Продавцы «извне» и их продажи
+    // "Outside" sellers and their sells
     let mut st = conn.prepare(
         "WITH buyers AS (SELECT DISTINCT fee_payer FROM swaps WHERE pool = ?1 AND trade_direction = 1)
          SELECT fee_payer, signature, block_time, included_fee_input_amount, output_amount FROM swaps
@@ -210,7 +210,7 @@ pub async fn run(rpc: &Rpc, db_path: &str, prefix: &str, csv: Option<&str>) -> R
         sells.entry(w).or_default().push(Sell { sig, time: t, tokens: tok as u64, sol: sol as u64 });
     }
 
-    // 2. Откуда токены
+    // 2. Where the tokens came from
     println!("## 2. Where the sellers' tokens came from\n");
     println!("{} wallets sold tokens in this pool without buying any here.\n", order.len());
     println!("| wallet | received | from | transfer tx | time |");
@@ -258,7 +258,7 @@ pub async fn run(rpc: &Rpc, db_path: &str, prefix: &str, csv: Option<&str>) -> R
     }
     println!();
 
-    // 3. Продажи обратно в пул
+    // 3. Sells back into the pool
     println!("## 3. Selling back into the pool\n");
     println!("| wallet | sells | tokens sold | SOL received | first sell |");
     println!("|---|---|---|---|---|");
@@ -298,7 +298,7 @@ pub async fn run(rpc: &Rpc, db_path: &str, prefix: &str, csv: Option<&str>) -> R
         Err(_) => println!("- not recorded (pool not graduated while tracked)\n"),
     }
 
-    // 5. Выход
+    // 5. Exit
     println!("## 5. Exit after migration\n");
     match csv {
         None => println!("Pass `--csv <Solscan DeFi Activities export of the creator>` to include this step.\n"),
@@ -307,7 +307,7 @@ pub async fn run(rpc: &Rpc, db_path: &str, prefix: &str, csv: Option<&str>) -> R
             if rows.is_empty() {
                 println!("No rows for this token in the CSV (export window may not cover this launch).\n");
             }
-            // только действия выхода: вывод остатка из DBC, операции в DAMM v2; по времени, затем по смыслу
+            // exit actions only: leftover withdrawal from DBC, DAMM v2 operations; by time, then by meaning
             let rank = |c: &Vec<String>| -> u8 {
                 match (c[3].as_str(), c[12].contains("dbcij"), c[12].contains("cpamd")) {
                     ("ACTIVITY_TOKEN_REMOVE_LIQ", true, _) => 0,

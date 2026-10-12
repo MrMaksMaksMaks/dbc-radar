@@ -1,13 +1,13 @@
-//! Чтение данных сборщика (dbc.sqlite).
+//! Reading the collector data (dbc.sqlite).
 
 use crate::engine::{PoolInit, RecordedSwap};
 use anyhow::{bail, Context, Result};
 use dynamic_bonding_curve::state::{PoolConfig, SwapResult2};
 use rusqlite::{params, Connection};
 
-/// Дискриминатор аккаунта PoolConfig (из IDL).
+/// PoolConfig account discriminator (from the IDL).
 pub const POOL_CONFIG_DISC: [u8; 8] = [26, 108, 14, 123, 116, 230, 129, 43];
-/// Дискриминатор ConfigWithTransferHook: { config: PoolConfig, transfer_hook_program: Pubkey, padding }.
+/// ConfigWithTransferHook discriminator: { config: PoolConfig, transfer_hook_program: Pubkey, padding }.
 pub const CONFIG_WITH_TH_DISC: [u8; 8] = [0x28, 0xDC, 0xC2, 0xFB, 0x29, 0xC7, 0x7B, 0xFD];
 
 pub fn open(path: &str) -> Result<Connection> {
@@ -15,7 +15,7 @@ pub fn open(path: &str) -> Result<Connection> {
         .with_context(|| format!("open {path}"))
 }
 
-/// Находит пул по началу адреса (например "28VR").
+/// Finds a pool by an address prefix (e.g. "28VR").
 pub fn find_pool(conn: &Connection, prefix: &str) -> Result<PoolInit> {
     let mut st = conn.prepare(
         "SELECT pool, config, creator, base_mint, pool_type, activation_point, created_sig
@@ -45,9 +45,9 @@ pub fn load_config(conn: &Connection, config: &str) -> Result<PoolConfig> {
     Ok(load_config_ext(conn, config)?.0)
 }
 
-/// Конфиг и, для конфигов с transfer hook, адрес программы-хука.
-/// ConfigWithTransferHook начинается с той же структуры PoolConfig, поэтому
-/// все поля читаются одинаково.
+/// The config and, for configs with a transfer hook, the hook program address.
+/// ConfigWithTransferHook starts with the same PoolConfig struct, so
+/// all fields are read the same way.
 pub fn load_config_ext(conn: &Connection, config: &str) -> Result<(PoolConfig, Option<String>)> {
     let raw: Option<Vec<u8>> = conn
         .query_row("SELECT raw FROM configs WHERE config = ?1", params![config], |r| r.get(0))
@@ -146,7 +146,7 @@ mod tests {
         assert!(load_config_ext(&conn, "a").unwrap().1.is_none());
         let hook = load_config_ext(&conn, "b").unwrap().1.unwrap();
         assert_eq!(hook, anchor_lang::prelude::Pubkey::new_from_array([7u8; 32]).to_string());
-        // размер как в программе: 8 + PoolConfig + 32 + 48 = 8 + 1120
+        // size as in the program: 8 + PoolConfig + 32 + 48 = 8 + 1120
         assert_eq!(hooked.len(), 8 + 1120);
     }
 }

@@ -1,10 +1,10 @@
-//! dbc-collector: собирает пулы и свопы Meteora DBC в SQLite.
+//! dbc-collector: collects Meteora DBC pools and swaps into SQLite.
 //!
-//! Задачи:
-//!   - discovery::run_ws     — websocket logsSubscribe, ловит создание пулов;
-//!   - discovery::run_worker — забирает транзакции создания и пишет пулы;
-//!   - poller::run           — собирает свопы отслеживаемых пулов;
-//!   - status::run           — отмечает graduation по аккаунтам пулов (все пулы, не только отслеживаемые).
+//! Tasks:
+//!   - discovery::run_ws     — websocket logsSubscribe, catches pool creation;
+//!   - discovery::run_worker — fetches creation transactions and writes pools;
+//!   - poller::run           — collects swaps of tracked pools;
+//!   - status::run           — marks graduation from pool accounts (all pools, not only tracked ones).
 
 mod app;
 mod db;
@@ -56,13 +56,13 @@ async fn main() -> Result<()> {
     let track_hours: i64 = env_or("TRACK_HOURS", "24").parse().context("TRACK_HOURS")?;
     let poll_interval_secs: u64 =
         env_or("POLL_INTERVAL_SECS", "20").parse().context("POLL_INTERVAL_SECS")?;
-    // проверка graduation по аккаунтам: как часто и за сколько часов назад
+    // graduation check via accounts: how often, and how many hours back
     let grad_check_secs: u64 = env_or("GRAD_CHECK_SECS", "120").parse().context("GRAD_CHECK_SECS")?;
     let grad_check_hours: i64 = env_or("GRAD_CHECK_HOURS", "24").parse().context("GRAD_CHECK_HOURS")?;
-    // отдельный узел для этой проверки (у PublicNode предел ~6 адресов на getMultipleAccounts)
+    // a separate node for this check (PublicNode allows ~6 addresses per getMultipleAccounts)
     let status_rpc_url = env_or("STATUS_RPC_URL", &rpc_url);
     let status_rps: f64 = env_or("STATUS_RPC_RPS", "2").parse().context("STATUS_RPC_RPS")?;
-    // запасной RPC для транзакций, которые основной узел уже не отдаёт; по умолчанию HISTORY_RPC_URL
+    // backup RPC for transactions the main node no longer serves; HISTORY_RPC_URL by default
     let backup_url = env_or("BACKUP_RPC_URL", &env_or("HISTORY_RPC_URL", ""));
     let backup_rps: f64 = env_or("BACKUP_RPC_RPS", "2").parse().context("BACKUP_RPC_RPS")?;
     let backup_max_per_hour: u32 = env_or("BACKUP_MAX_PER_HOUR", "1000").parse().context("BACKUP_MAX_PER_HOUR")?;
@@ -78,10 +78,10 @@ async fn main() -> Result<()> {
         allowlist = config_allowlist.len(), "starting dbc-collector"
     );
 
-    // Режим проверки: `dbc-collector decode <signature>` — разобрать одну транзакцию
-    // и напечатать найденные события DBC, ничего не записывая в базу.
+    // Inspection mode: `dbc-collector decode <signature>` — parse one transaction
+    // and print the DBC events found, without writing anything to the database.
     let args: Vec<String> = std::env::args().collect();
-    // Режим доказательств: `dbc-collector trace <pool prefix> [--csv export.csv]`
+    // Evidence mode: `dbc-collector trace <pool prefix> [--csv export.csv]`
     if args.get(1).map(String::as_str) == Some("trace") {
         let prefix = args.get(2).context("usage: dbc-collector trace <pool prefix> [--csv solscan_export.csv]")?;
         let csv = args.iter().position(|a| a == "--csv").and_then(|i| args.get(i + 1)).map(String::as_str);
@@ -103,8 +103,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Разовый проход: `dbc-collector grad-sweep <hours>` — отметить graduation по аккаунтам
-    // пулов, созданных за последние <hours> часов (например, для старых данных).
+    // One-off pass: `dbc-collector grad-sweep <hours>` — mark graduation from the accounts
+    // of pools created in the last <hours> hours (e.g. for old data).
     if args.get(1).map(String::as_str) == Some("grad-sweep") {
         let hours: i64 = args.get(2).context("usage: dbc-collector grad-sweep <hours>")?.parse().context("hours")?;
         let rpc = rpc::Rpc::new(status_rpc_url, status_rps);
@@ -115,7 +115,7 @@ async fn main() -> Result<()> {
     }
 
     tracing::info!(%status_rpc_url, status_rps, "graduation check from pool accounts");
-    // в журнал — только хост запасного RPC: в URL может быть ключ
+    // only the backup RPC host goes to the log: the URL may contain a key
     let backup_host = backup_url.split('/').nth(2).unwrap_or("-").to_string();
     tracing::info!(backup = %backup_host, backup_rps, backup_max_per_hour, "backup RPC for transactions the main node no longer serves");
     let app = Arc::new(app::App {

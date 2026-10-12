@@ -1,15 +1,15 @@
-//! Оценка риска конфига DBC.
+//! Risk scoring of a DBC config.
 //!
-//! Две группы признаков:
-//!   1. Из самого аккаунта конфига — известны ДО первой покупки:
-//!      кому и в каком виде достаётся ликвидность после миграции, сколько токенов
-//!      уходит leftover receiver, комиссия миграции, права на токен.
-//!   2. Из поведения пулов этого конфига в базе сборщика:
-//!      сколько создателей им пользуются, доля стартовой покупки создателя,
-//!      кошельки, продающие токены, которых они не покупали в пуле.
+//! Two groups of signals:
+//!   1. From the config account itself — known BEFORE the first buy:
+//!      who gets the liquidity after migration and in what form, how many tokens
+//!      go to the leftover receiver, the migration fee, token authorities.
+//!   2. From the behaviour of this config's pools in the collector database:
+//!      how many creators use it, the share of the creator's opening buy,
+//!      wallets that sell tokens they did not buy in the pool.
 //!
-//! Баллы — эвристика, а не вердикт. Каждый флаг печатается с объяснением,
-//! чтобы читатель видел, из чего сложилась оценка.
+//! Points are a heuristic, not a verdict. Every flag is printed with an explanation,
+//! so the reader can see what the score is made of.
 
 use anyhow::Result;
 use dynamic_bonding_curve::state::{LiquidityVestingInfo, PoolConfig};
@@ -17,15 +17,15 @@ use rusqlite::{params, Connection};
 
 #[derive(Debug, Clone)]
 pub struct LpSplit {
-    /// % ликвидности, которую можно вывести сразу после миграции
+    /// % of liquidity that can be withdrawn right after migration
     pub creator_unlocked: u8,
     pub partner_unlocked: u8,
-    /// % навсегда заблокировано
+    /// % permanently locked
     pub locked: u8,
-    /// % с вестингом
+    /// % with vesting
     pub creator_vest: u8,
     pub partner_vest: u8,
-    /// через сколько секунд после миграции вестинг полностью разблокирован (максимум из двух)
+    /// how many seconds after migration the vesting is fully unlocked (the max of the two)
     pub vest_full_release_secs: u64,
 }
 
@@ -40,26 +40,26 @@ pub struct ConfigFacts {
     pub has_fee_scheduler: bool,
     pub threshold: u64,
     pub token_decimal: u8,
-    /// программа transfer hook (у конфигов ConfigWithTransferHook)
+    /// transfer hook program (for ConfigWithTransferHook configs)
     pub transfer_hook: Option<String>,
-    /// порог миграции ~0 при quote = SOL: кривой как рынка нет, токен сразу уходит в DAMM v2
+    /// migration threshold ~0 with quote = SOL: there is no curve as a market, the token goes straight to DAMM v2
     pub instant_graduation: bool,
-    /// базовая торговая комиссия: (режим 0 линейный / 1 экспоненциальный / 2 ограничитель,
-    /// начальный числитель из 1e9, число периодов, длина периода, снижение за период)
+    /// base trading fee: (mode 0 linear / 1 exponential / 2 rate limiter,
+    /// starting numerator out of 1e9, number of periods, period length, reduction per period)
     pub base_fee: (u8, u64, u16, u64, u64),
-    /// 0 — периоды в слотах, 1 — в секундах
+    /// 0 — periods in slots, 1 — in seconds
     pub activation_type: u8,
-    /// доля создателя в торговой комиссии после доли протокола (остальное — партнёру)
+    /// creator's share of the trading fee after the protocol share (the rest goes to the partner)
     pub creator_trading_fee_pct: u8,
     pub fee_claimer: Option<String>,
     pub leftover_receiver: Option<String>,
-    /// во скольких конфигах базы этот адрес — получатель остатка (>= PLATFORM_MIN_CONFIGS: адрес платформы)
+    /// in how many configs of the database this address is the leftover receiver (>= PLATFORM_MIN_CONFIGS: a platform address)
     pub leftover_receiver_configs: usize,
 }
 
-/// Адрес, получающий остаток в стольких конфигах, считаем служебным адресом платформы.
+/// An address receiving the leftover in this many configs is treated as a platform service address.
 pub const PLATFORM_MIN_CONFIGS: usize = 10;
-/// Порог миграции ниже 0,1 SOL — «мгновенная graduation».
+/// Migration threshold below 0.1 SOL — "instant graduation".
 pub const INSTANT_THRESHOLD_LAMPORTS: u64 = 100_000_000;
 const WSOL: &str = "So11111111111111111111111111111111111111112";
 
@@ -73,7 +73,7 @@ fn vest_release(v: &LiquidityVestingInfo) -> u64 {
 pub fn config_facts(c: &PoolConfig) -> ConfigFacts {
     let pv = c.partner_liquidity_vesting_info.vesting_percentage;
     let cv = c.creator_liquidity_vesting_info.vesting_percentage;
-    // Как в get_liquidity_distribution программы: доля создателя — остаток.
+    // As in the program's get_liquidity_distribution: the creator's share is the remainder.
     let creator_unlocked = 100u8
         .saturating_sub(c.partner_liquidity_percentage)
         .saturating_sub(c.partner_permanent_locked_liquidity_percentage)
@@ -96,9 +96,9 @@ pub fn config_facts(c: &PoolConfig) -> ConfigFacts {
         .saturating_add(lv.amount_per_period.saturating_mul(lv.number_of_period));
     let used = c.swap_base_amount.saturating_add(c.migration_base_threshold).saturating_add(locked_tokens);
 
-    // Фиксированный supply: после миграции остаток сверх post_migration_token_supply сжигается,
-    // а то, что остаётся в пределах post supply, получает leftover_receiver.
-    // Нефиксированный supply: весь остаток сжигается.
+    // Fixed supply: after migration, the leftover beyond post_migration_token_supply is burned,
+    // and what remains within the post supply goes to the leftover_receiver.
+    // Non-fixed supply: the whole leftover is burned.
     let (total_supply, leftover_to_receiver) = if c.fixed_token_supply_flag == 1 {
         (c.post_migration_token_supply, c.post_migration_token_supply.saturating_sub(used))
     } else {
@@ -135,13 +135,13 @@ pub struct Behavior {
     pub top_creator_pools: u64,
     pub tracked: u64,
     pub graduated: u64,
-    /// медиана стартовой покупки создателя в % от порога миграции (по отслеживаемым пулам)
+    /// median of the creator's opening buy as % of the migration threshold (over tracked pools)
     pub median_prebuy_pct: Option<f64>,
-    /// медиана числа кошельков, продававших токены, которых не покупали в пуле
+    /// median number of wallets that sold tokens they did not buy in the pool
     pub median_outside_wallets: Option<f64>,
-    /// медиана SOL, полученных такими кошельками
+    /// median SOL received by such wallets
     pub median_outside_sol: Option<f64>,
-    /// кошельки фермы и синтетичность активности (признаки 4, 7–11)
+    /// farm wallets and how synthetic the activity is (signals 4, 7–11)
     pub farm: Option<crate::farm::FarmStats>,
 }
 
@@ -195,14 +195,14 @@ pub fn behavior(conn: &Connection, config: &str, threshold: u64) -> Result<Behav
          WHERE s.pool = ?1 AND s.trade_direction = 0 AND s.fee_payer <> p.creator
            AND s.fee_payer NOT IN (SELECT fee_payer FROM swaps b WHERE b.pool = ?1 AND b.trade_direction = 1)",
     )?;
-    // сколько токенов купил создатель: раздать на кривой он может не больше
+    // how many tokens the creator bought: it cannot distribute more than that on the curve
     let mut creator_bought = conn.prepare(
         "SELECT COALESCE(SUM(s.output_amount), 0) FROM swaps s JOIN pools p ON p.pool = s.pool
          WHERE s.pool = ?1 AND s.trade_direction = 1 AND s.fee_payer = p.creator",
     )?;
     for (pool, pb, grad, n_swaps) in rows {
         if n_swaps == 0 {
-            continue; // пул ещё не торговался или данные не собраны
+            continue; // the pool has not traded yet or the data is not collected
         }
         b.tracked += 1;
         if grad {
@@ -213,8 +213,8 @@ pub fn behavior(conn: &Connection, config: &str, threshold: u64) -> Result<Behav
         }
         let (w, sol, tokens): (i64, i64, i64) = outside.query_row(params![pool], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         let bought: i64 = creator_bought.query_row(params![pool], |r| r.get(0))?;
-        // продавцы без покупки продали больше, чем купил создатель: раздача не от оператора
-        // (например, снайпер раздал купленное своим кошелькам) — не считаем её признаком
+        // sellers without a buy sold more than the creator bought: the distribution is not from the operator
+        // (e.g. a sniper distributed its purchase to its own wallets) — we do not count it as a signal
         if (tokens as i128) * 100 > (bought as i128) * 105 {
             ow.push(0.0);
             osol.push(0.0);
@@ -235,13 +235,13 @@ pub struct Flag {
     pub text: String,
 }
 
-/// Итог по конфигу: две оси и вердикт.
+/// Result for a config: two axes and a verdict.
 #[derive(Debug, Clone)]
 pub struct Report {
-    /// Что конфиг ПОЗВОЛЯЕТ сделать (только аккаунт конфига), 0..100
+    /// What the config ALLOWS (config account only), 0..100
     pub capability: u32,
     pub capability_flags: Vec<Flag>,
-    /// Что РЕАЛЬНО наблюдалось в пулах этого конфига, 0..100; None — нет отслеживаемых пулов
+    /// What was ACTUALLY observed in this config's pools, 0..100; None — no tracked pools
     pub evidence: Option<u32>,
     pub evidence_flags: Vec<Flag>,
     pub verdict: Verdict,
@@ -249,13 +249,13 @@ pub struct Report {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Verdict {
-    /// Активность в пулах создают сам создатель и связанные с ним кошельки
+    /// The activity in the pools is created by the creator itself and wallets linked to it
     Synthetic,
-    /// Сам конфиг чист по наблюдениям, но связан общими адресами с RED-конфигами
+    /// The config itself is clean by observations, but linked by shared addresses to RED configs
     RedLinked,
-    /// Конфиг позволяет вывести ликвидность и сбросить крупный остаток supply
+    /// The config allows withdrawing the liquidity and dumping a large supply leftover
     RugCapable,
-    /// Создатель сам проходит кривую целиком: покупателей на кривой нет
+    /// The creator goes through the whole curve itself: there are no buyers on the curve
     SelfGraduation,
     Standard,
 }
@@ -291,12 +291,12 @@ fn human_secs(s: u64) -> String {
     }
 }
 
-/// Веса откалиброваны по 167 реальным конфигам (2 октября 2026):
-///   * незаблокированная LP сама по себе — норма (шаблон Meteora Invent: partner 50% + creator 40% unlocked);
-///   * 100% навсегда заблокированной LP — самый частый вариант (100 из 167 конфигов), продаж «извне» в нём не наблюдалось;
-///   * связка «creator unlocked >= 50% + leftover >= 20% supply» — 51 конфиг, 78% наблюдаемых пулов;
-///     продажи токенов «извне» видны в 13 из 32 таких конфигов с данными и ни в одном из остальных 27.
-/// Параметры «налога на снайперов», если конфиг под него подходит.
+/// Weights calibrated on 167 real configs (October 2, 2026):
+///   * unlocked LP on its own is normal (the Meteora Invent template: partner 50% + creator 40% unlocked);
+///   * 100% permanently locked LP is the most common setup (100 of 167 configs), no selling "from outside" observed in it;
+///   * the combination "creator unlocked >= 50% + leftover >= 20% of supply" — 51 configs, 78% of observed pools;
+///     selling of tokens "from outside" is seen in 13 of 32 such configs with data and in none of the other 27.
+/// "Sniper fee" parameters, if the config qualifies.
 pub struct FeeTrap {
     pub start_pct: f64,
     pub secs: u64,
@@ -304,10 +304,10 @@ pub struct FeeTrap {
     pub receiver: &'static str,
 }
 
-/// Пороги вердиктов. Значения по умолчанию — те, на которых движок проверялся на данных;
-/// любое можно переопределить переменной окружения (или строкой в ./.env), например
-/// RISK_FEE_TRAP_MIN_START_PCT=60. Неверное значение — предупреждение в stderr и значение по умолчанию.
-/// `dbc-replay <db> thresholds` печатает действующие значения.
+/// Verdict thresholds. The defaults are the values the engine was validated with on the data;
+/// any of them can be overridden with an environment variable (or a line in ./.env), e.g.
+/// RISK_FEE_TRAP_MIN_START_PCT=60. An invalid value — a warning to stderr and the default value.
+/// `dbc-replay <db> thresholds` prints the effective values.
 #[derive(Debug, Clone)]
 pub struct Thresholds {
     pub red_min_evidence: u32,
@@ -343,7 +343,7 @@ impl Default for Thresholds {
     }
 }
 
-/// (переменная, значение, по умолчанию, что задаёт)
+/// (variable, value, default, what it sets)
 pub type ThresholdRow = (&'static str, String, String, &'static str);
 
 impl Thresholds {
@@ -421,16 +421,16 @@ impl Thresholds {
 
 static THRESHOLDS: std::sync::OnceLock<Thresholds> = std::sync::OnceLock::new();
 
-/// Действующие пороги (читаются один раз за запуск).
+/// Effective thresholds (read once per run).
 pub fn thresholds() -> &'static Thresholds {
     THRESHOLDS.get_or_init(Thresholds::from_env)
 }
 
-/// Защита конфигов платформ: конфиг лаунчпада (у партнёра много конфигов, синтетика меньше чем
-/// в половине), где запускают многие создатели, получает RED только при прямом доказательстве —
-/// массовой раздаче или торговле через подставные кошельки. Иначе AMBER с пояснением:
-/// признаки остаются видны, но вердикт не читается как обвинение платформы.
-/// Возвращает true, если вердикт понижен.
+/// Platform config guard: a launchpad config (the partner has many configs, synthetic trading in fewer than
+/// half) used by many creators gets RED only with direct evidence —
+/// mass fan-out or trading through proxy wallets. Otherwise AMBER with an explanation:
+/// the signals stay visible, but the verdict does not read as an accusation of the platform.
+/// Returns true if the verdict was downgraded.
 pub fn platform_guard(rep: &mut Report, b: &Behavior, partner_configs: usize, partner_synthetic: usize) -> bool {
     let th = thresholds();
     if rep.verdict != Verdict::Synthetic
@@ -460,10 +460,10 @@ pub fn platform_guard(rep: &mut Report, b: &Behavior, partner_configs: usize, pa
 pub fn fee_trap(f: &ConfigFacts) -> Option<FeeTrap> {
     let (mode, cliff, periods, period_len, _) = f.base_fee;
     if mode > 1 || periods == 0 || period_len == 0 {
-        return None; // ограничитель скорости или плоская комиссия
+        return None; // rate limiter or flat fee
     }
     let start_pct = cliff as f64 / 1e7;
-    // activation_type 0: периоды в слотах (~0,4 с)
+    // activation_type 0: periods in slots (~0.4 s)
     let raw = periods as u64 * period_len;
     let secs = if f.activation_type == 0 { raw * 2 / 5 } else { raw };
     let cr = f.creator_trading_fee_pct as f64;
@@ -478,7 +478,7 @@ pub fn score(f: &ConfigFacts, b: &Behavior) -> Report {
     let lp = &f.lp;
     let leftover_pct = if f.total_supply > 0 { 100.0 * f.leftover_to_receiver as f64 / f.total_supply as f64 } else { 0.0 };
 
-    // --- Возможности конфига ---
+    // --- Config capabilities ---
     let mut cap = Vec::new();
     let add = |v: &mut Vec<Flag>, points: u32, text: String| v.push(Flag { points, text });
     let creator_heavy = lp.creator_unlocked >= 50;
@@ -519,9 +519,9 @@ pub fn score(f: &ConfigFacts, b: &Behavior) -> Report {
     if vest > 0 && vest + lp.locked < 50 && lp.vest_full_release_secs <= 7 * 86_400 {
         add(&mut cap, 5, format!("vested {}% of liquidity fully unlocks {} after migration", vest, human_secs(lp.vest_full_release_secs)));
     }
-    // Комиссия миграции забирает эту долю SOL, собранных на кривой: в пул после миграции уходит
-    // только остаток (PoolConfig::get_migration_quote_amount). При 50%+ покупатели теряют
-    // большую часть ликвидности в момент graduation — это само по себе рискованный конфиг.
+    // The migration fee takes this share of the SOL collected on the curve: only the remainder goes
+    // to the post-migration pool (PoolConfig::get_migration_quote_amount). At 50%+ buyers lose
+    // most of the liquidity at the moment of graduation — this alone is a risky config.
     let fee = f.migration_fee_pct;
     if fee >= 10 {
         let points = match fee {
@@ -547,9 +547,9 @@ pub fn score(f: &ConfigFacts, b: &Behavior) -> Report {
     if matches!(f.update_authority, 3 | 4) {
         add(&mut cap, 40, "a creator or partner keeps MINT authority over the token".into());
     }
-    // «Налог на снайперов»: стартовая комиссия 70%+ снижается дольше 90 с, и 80%+ комиссии
-    // (после доли протокола) получает один адрес. Ранние покупатели отдают большую часть SOL
-    // комиссией этому адресу. Это возможность конфига (видна в параметрах), не доказательство.
+    // "Sniper fee": a starting fee of 70%+ decays for longer than 90 s, and 80%+ of the fee
+    // (after the protocol share) goes to one address. Early buyers hand most of their SOL
+    // to this address as a fee. This is a config capability (visible in the parameters), not evidence.
     if let Some(t) = fee_trap(f) {
         add(&mut cap, th.fee_trap_points, format!(
             "sniper fee: trading fee starts at {:.0}% and decays over {}; {:.0}% of the fee (after the protocol share) goes to {}: \
@@ -559,7 +559,7 @@ pub fn score(f: &ConfigFacts, b: &Behavior) -> Report {
     }
     let capability = cap.iter().map(|f| f.points).sum::<u32>().min(100);
 
-    // --- Наблюдаемое поведение ---
+    // --- Observed behaviour ---
     let mut ev = Vec::new();
     let self_grad = f.instant_graduation
         || matches!((b.median_prebuy_pct, b.median_outside_wallets), (Some(p), Some(w)) if p >= 95.0 && w < 1.0);
@@ -578,8 +578,8 @@ pub fn score(f: &ConfigFacts, b: &Behavior) -> Report {
         if let Some(sh) = fs.median_linked_share {
             let only_creator = fs.farm_wallets < 3 && fs.master_wallets == 0;
             if sh >= th.strong_linked_share && only_creator {
-                // почти весь объём — сделки самого создателя: другие почти не торгуют
-                // (брошенный запуск или продажа внешним), это не производство объёма фермой
+                // almost all volume is the creator's own trades: others barely trade
+                // (an abandoned launch or selling to externals), this is not farm-produced volume
                 add(&mut ev, 20, format!(
                     "{:.0}% of trading volume (median per pool) comes from the creator itself: few other traders",
                     sh * 100.0
@@ -626,8 +626,8 @@ pub fn score(f: &ConfigFacts, b: &Behavior) -> Report {
         if fs.first_buyers > 0 {
             add(&mut ev, 15, format!("{} wallet(s) buy in the first seconds of most pools of this config", fs.first_buyers));
         }
-        // скриптовый старт: одинаковая первая покупка создателя или, если оператор начинает
-        // с кошелька фермы, одинаковая первая покупка не от создателя; баллы — один раз
+        // scripted start: the same first buy by the creator or, if the operator starts
+        // from a farm wallet, the same first non-creator buy; points are given once
         if let Some((sol, share)) = fs.dev_buy_mode.filter(|(_, s)| *s >= 0.8) {
             add(
                 &mut ev,
@@ -665,12 +665,12 @@ pub fn score(f: &ConfigFacts, b: &Behavior) -> Report {
     }
     let evidence = if b.tracked > 0 { Some(ev.iter().map(|f| f.points).sum::<u32>().min(100)) } else { None };
 
-    // RED требует сильного торгового доказательства: не меньше 80% объёма у связанных кошельков
-    // или массовая раздача (10+ продавцов без покупок на пул). Сумма слабых признаков (около
-    // половины связанного объёма, один создатель, одинаковая первая покупка) RED не даёт:
-    // вердикт тогда определяется конфигом, а признаки остаются видны в отчёте.
-    // 80% связанного объёма засчитывается, только если связаны не один создатель:
-    // 3+ кошелька фермы или мастер-кошелёк с прокси (иначе это объём самого создателя).
+    // RED needs strong trading evidence: at least 80% of the volume from linked wallets
+    // or mass fan-out (10+ sellers without buys per pool). A sum of weak signals (about
+    // half of the volume linked, a single creator, the same first buy) does not give RED:
+    // the verdict is then set by the config, and the signals remain visible in the report.
+    // 80% linked volume counts only if more than just the creator is linked:
+    // 3+ farm wallets or a master wallet with proxies (otherwise it is the creator's own volume).
     let strong_trading = b.median_outside_wallets.unwrap_or(0.0) >= th.strong_fanout_wallets
         || b.farm.as_ref().is_some_and(|fs| {
             fs.median_linked_share.unwrap_or(0.0) >= th.strong_linked_share && (fs.farm_wallets >= 3 || fs.master_wallets >= 1)
@@ -724,28 +724,28 @@ mod tests {
             verdict: Verdict::Synthetic,
         };
         let farm = |masters| Some(crate::farm::FarmStats { master_wallets: masters, ..Default::default() });
-        // конфиг лаунчпада (7 конфигов, синтетика в 2), 30 создателей, без раздачи и прокси → AMBER
+        // launchpad config (7 configs, synthetic trading in 2), 30 creators, no fan-out and no proxies → AMBER
         let b = Behavior { pools: 62, creators: 30, median_outside_wallets: Some(1.0), farm: farm(0), ..Default::default() };
         let mut r = red();
         assert!(platform_guard(&mut r, &b, 7, 2));
         assert_eq!(r.verdict, Verdict::RugCapable);
         assert!(r.evidence_flags.iter().any(|f| f.points == 0 && f.text.contains("launchpad with 7 configs")));
-        // массовая раздача — прямое доказательство, RED остаётся
+        // mass fan-out is direct evidence, RED stays
         let mut r = red();
         assert!(!platform_guard(&mut r, &Behavior { median_outside_wallets: Some(27.0), ..b.clone() }, 7, 2));
         assert_eq!(r.verdict, Verdict::Synthetic);
-        // торговля через подставные кошельки — тоже
+        // trading through proxy wallets — too
         let mut r = red();
         assert!(!platform_guard(&mut r, &Behavior { farm: farm(1), ..b.clone() }, 7, 2));
-        // мало создателей: конфиг фактически одного оператора
+        // few creators: the config effectively belongs to one operator
         let mut r = red();
         assert!(!platform_guard(&mut r, &Behavior { creators: 7, ..b.clone() }, 7, 2));
-        // у партнёра один конфиг (бандл-шаблон) или синтетика у половины конфигов: не платформа
+        // the partner has one config (bundle template) or synthetic trading in half of its configs: not a platform
         let mut r = red();
         assert!(!platform_guard(&mut r, &b, 1, 1));
         let mut r = red();
         assert!(!platform_guard(&mut r, &b, 6, 3));
-        // не RED — не трогаем
+        // not RED — leave it alone
         let mut r = Report { verdict: Verdict::Standard, ..red() };
         assert!(!platform_guard(&mut r, &b, 7, 2));
         assert_eq!(r.verdict, Verdict::Standard);
@@ -761,21 +761,21 @@ mod tests {
     #[test]
     fn sniper_fee_is_amber_not_red() {
         let b = Behavior { pools: 20, creators: 15, ..Default::default() };
-        // 90% -> снижение 120 периодов по 1 с, 100% комиссии создателю: ловушка
+        // 90% -> decay over 120 periods of 1 s, 100% of the fee to the creator: a trap
         let mut f = plain_facts();
         f.base_fee = (0, 900_000_000, 120, 1, 7_400_000);
         f.creator_trading_fee_pct = 100;
         let r = score(&f, &b);
         assert_eq!(r.verdict, Verdict::RugCapable, "{:?}", r.capability_flags);
         assert!(r.capability_flags.iter().any(|x| x.text.starts_with("sniper fee") && x.text.contains("the creator")));
-        // то же, но комиссия делится 50/50: одного получателя нет
+        // the same, but the fee is split 50/50: there is no single receiver
         f.creator_trading_fee_pct = 50;
         assert_eq!(score(&f, &b).verdict, Verdict::Standard);
-        // обычный антиснайпер платформы: 50% за 60 с
+        // a platform's regular anti-sniper fee: 50% for 60 s
         f.creator_trading_fee_pct = 0;
         f.base_fee = (1, 500_000_000, 60, 1, 1_000);
         assert_eq!(score(&f, &b).verdict, Verdict::Standard);
-        // периоды в слотах: 300 слотов ≈ 120 с, 80% партнёру — ловушка
+        // periods in slots: 300 slots ≈ 120 s, 80% to the partner — a trap
         f.base_fee = (0, 800_000_000, 30, 10, 1_000);
         f.activation_type = 0;
         f.creator_trading_fee_pct = 20;
@@ -783,9 +783,9 @@ mod tests {
         assert_eq!((t.secs, t.receiver), (120, "the launchpad (fee claimer)"));
     }
 
-    /// Конфиг бандл-шаблона (89% ликвидности создателю без блокировки, остаток 90%) должен получить CRITICAL,
-    /// а тот же конфиг с заблокированной ликвидностью и без остатка — LOW.
-    /// DBC_FIXTURE_CONFIG=/путь/к/fee_in_quote_config.bin ; RISK_DB=/tmp/risk.sqlite — сохранить тестовую базу.
+    /// A bundle-template config (89% of liquidity to the creator unlocked, 90% leftover) must get CRITICAL,
+    /// and the same config with locked liquidity and no leftover — LOW.
+    /// DBC_FIXTURE_CONFIG=/path/to/fee_in_quote_config.bin ; RISK_DB=/tmp/risk.sqlite — keep the test database.
     #[test]
     fn scores_rug_style_config_as_critical() {
         let Ok(path) = std::env::var("DBC_FIXTURE_CONFIG") else {
@@ -819,7 +819,7 @@ mod tests {
         assert_eq!(f.lp.creator_unlocked, 89);
         assert_eq!(f.leftover_to_receiver, 900_000_000_000_000);
 
-        // поведение: 6 пулов одного создателя, стартовая покупка 8.057 SOL, 20 продавцов-сателлитов
+        // behaviour: 6 pools by one creator, opening buy 8.057 SOL, 20 satellite sellers
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE pools(pool, config, creator, base_mint, pool_type, activation_point, transfer_hook,
@@ -864,8 +864,8 @@ mod tests {
         assert_eq!(r.verdict, Verdict::Synthetic);
         assert_eq!(r.capability, 60);
 
-        // Слабые признаки (одинаковая первая покупка, один создатель) без сильного торгового
-        // доказательства RED не дают, даже если баллов набралось 50+.
+        // Weak signals (the same first buy, a single creator) without strong trading
+        // evidence do not give RED, even if they add up to 50+ points.
         let weak = Behavior {
             pools: 7,
             creators: 1,
@@ -880,7 +880,7 @@ mod tests {
             ..Default::default()
         };
         let rw = score(&f, &weak);
-        // почти весь объём — сделки создателя, ферм и мастеров нет: не RED
+        // almost all volume is the creator's trades, no farms or masters: not RED
         let creator_only = Behavior {
             pools: 8,
             creators: 1,
@@ -895,10 +895,10 @@ mod tests {
         assert!(rw.evidence.unwrap() >= 50, "weak signals add up: {:?}", rw.evidence);
         assert_eq!(rw.verdict, Verdict::RugCapable, "weak signals do not make RED; the risky config gives AMBER");
 
-        // Тот же конфиг без наблюдений — только возможность.
+        // The same config without observations — capability only.
         assert_eq!(score(&f, &Behavior { pools: 3, creators: 3, ..Default::default() }).verdict, Verdict::RugCapable);
 
-        // Шаблон Meteora Invent по умолчанию: partner 50% + creator 40% unlocked, 10% locked, leftover 0.
+        // Default Meteora Invent template: partner 50% + creator 40% unlocked, 10% locked, leftover 0.
         let mut invent = c;
         invent.partner_liquidity_percentage = 50;
         invent.creator_liquidity_percentage = 40;
@@ -909,7 +909,7 @@ mod tests {
         let inv = score(&config_facts(&invent), &Behavior { pools: 40, creators: 35, ..Default::default() });
         assert_eq!(inv.verdict, Verdict::Standard, "{:?}", inv.capability_flags);
 
-        // Честный вариант: вся ликвидность навсегда заблокирована, остатка нет, конфиг общий.
+        // Honest setup: all liquidity permanently locked, no leftover, a shared config.
         let mut honest = c;
         honest.creator_liquidity_percentage = 0;
         honest.creator_permanent_locked_liquidity_percentage = 50;
@@ -921,7 +921,7 @@ mod tests {
         let h = score(&hf, &Behavior { pools: 40, creators: 35, ..Default::default() });
         assert_eq!((h.verdict, h.capability), (Verdict::Standard, 0));
 
-        // Мгновенная graduation распознаётся по конфигу, без наблюдений.
+        // Instant graduation is recognized from the config, without observations.
         let mut inst = c;
         inst.quote_mint = WSOL.parse().unwrap();
         inst.migration_quote_threshold = 1_000;
@@ -929,7 +929,7 @@ mod tests {
         assert!(fi.instant_graduation);
         assert_eq!(score(&fi, &Behavior::default()).verdict, Verdict::SelfGraduation);
 
-        // Остаток у адреса платформы (общий для многих конфигов): мягкий флаг вместо +55.
+        // Leftover at a platform address (shared by many configs): a soft flag instead of +55.
         let mut plat = config_facts(&honest);
         plat.leftover_to_receiver = plat.total_supply * 85 / 100;
         plat.leftover_receiver_configs = 38;
@@ -938,10 +938,10 @@ mod tests {
     }
 }
 
-/// Описание базовой комиссии для отчёта: начальная ставка, как и за сколько снижается, конечная.
+/// Base fee description for the report: starting rate, how and over what time it decays, final rate.
 pub fn describe_base_fee(f: &ConfigFacts) -> String {
     let (mode, cliff, n, freq, red) = f.base_fee;
-    let pct = |num: f64| num / 1e7; // числитель из 1e9 -> проценты
+    let pct = |num: f64| num / 1e7; // numerator out of 1e9 -> percent
     if !f.has_fee_scheduler {
         return format!("flat {:.2}%", pct(cliff as f64));
     }

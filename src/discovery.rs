@@ -1,14 +1,14 @@
-//! Обнаружение новых пулов: подписка logsSubscribe на программу DBC.
-//! В логах ищем инструкцию InitializeVirtualPool*, затем отдельный воркер
-//! забирает транзакцию по HTTP и декодирует EvtInitializePool.
+//! Discovery of new pools: a logsSubscribe subscription to the DBC program.
+//! In the logs we look for an InitializeVirtualPool* instruction, then a separate worker
+//! fetches the transaction over HTTP and decodes EvtInitializePool.
 //!
-//! Надёжность:
-//!   * несколько websocket-источников параллельно (WS_URLS), дубликаты отсекаются;
-//!   * сторожевой таймер: если источник молчит дольше WS_STALL_SECS, переподключаемся
-//!     (программа DBC активна постоянно, тишина означает зависший поток);
-//!   * для адресов из WATCH_ADDRESSES — прямой опрос их подписей по HTTP: полное
-//!     покрытие запусков конкретных операторов независимо от websocket;
-//!   * каждая подпись пишется в таблицу discovery с источником, чтобы измерять полноту.
+//! Reliability:
+//!   * several websocket sources in parallel (WS_URLS), duplicates are dropped;
+//!   * watchdog timer: if a source is silent for longer than WS_STALL_SECS, reconnect
+//!     (the DBC program is constantly active, silence means a stuck stream);
+//!   * for addresses in WATCH_ADDRESSES — direct polling of their signatures over HTTP: full
+//!     coverage of specific operators' launches regardless of websocket;
+//!   * every signature is written to the discovery table with its source, to measure completeness.
 
 use crate::app::App;
 use crate::tx::parse_tx;
@@ -72,7 +72,7 @@ async fn ws_session(app: &App, tx: &mpsc::Sender<Found>, url: &str, label: &str)
     }
 }
 
-/// Прямой опрос подписей отслеживаемых адресов (создателей, получателей комиссий).
+/// Direct polling of signatures of watched addresses (creators, fee receivers).
 pub async fn run_watch(app: Arc<App>, tx: mpsc::Sender<Found>) {
     if app.watch.is_empty() {
         return;
@@ -95,7 +95,7 @@ pub async fn run_watch(app: Arc<App>, tx: mpsc::Sender<Found>) {
                 }
                 Err(e) => {
                     if format!("{e:#}").contains("not found") {
-                        cursor.remove(addr); // RPC забыл подпись-курсор: начинаем заново
+                        cursor.remove(addr); // RPC forgot the cursor signature: start over
                     }
                     tracing::warn!(%addr, "watch poll failed: {e:#}");
                 }
@@ -126,7 +126,7 @@ fn handle_notification(text: &str, tx: &mpsc::Sender<Found>, label: &str) {
     }
 }
 
-/// Забирает найденные транзакции (из всех источников) и пишет их в базу.
+/// Fetches the found transactions (from all sources) and writes them to the database.
 pub async fn run_worker(app: Arc<App>, mut rx: mpsc::Receiver<Found>) {
     const RECENT: usize = 200_000;
     let mut seen: HashSet<String> = HashSet::new();
@@ -136,7 +136,7 @@ pub async fn run_worker(app: Arc<App>, mut rx: mpsc::Receiver<Found>) {
             tracing::warn!("record discovery: {e:#}");
         }
         if !seen.insert(sig.clone()) {
-            continue; // уже обработана из другого источника
+            continue; // already processed from another source
         }
         order.push_back(sig.clone());
         if order.len() > RECENT {
@@ -151,7 +151,7 @@ pub async fn run_worker(app: Arc<App>, mut rx: mpsc::Receiver<Found>) {
 }
 
 async fn process_creation(app: &App, sig: &str) -> Result<()> {
-    // Сразу после уведомления RPC может ещё не отдавать транзакцию.
+    // Right after the notification the RPC may not serve the transaction yet.
     for attempt in 0..6u64 {
         if let Some(raw) = app.rpc.get_transaction(sig).await? {
             let parsed = parse_tx(&raw)?;

@@ -1,12 +1,12 @@
-//! Проверка адресов, которых нет в базе сборщика: бот сам читает данные через RPC.
+//! Checking addresses that are not in the collector database: the bot reads the data over RPC itself.
 //!
-//!   * адрес пула DBC: читается аккаунт VirtualPool (или TransferHookPool) — из него
-//!     берутся конфиг, создатель и токен;
-//!   * адрес токена: самая ранняя транзакция токена — это создание пула (токен создаётся
-//!     инструкцией инициализации пула), из неё декодируется событие EvtInitializePool.
+//!   * DBC pool address: the VirtualPool (or TransferHookPool) account is read — it gives
+//!     the config, the creator and the token;
+//!   * token address: the token's earliest transaction is the pool creation (the token is created
+//!     by the pool initialization instruction); the EvtInitializePool event is decoded from it.
 //!
-//! Найденный пул и его конфиг дописываются в базу (пул помечается как неотслеживаемый),
-//! после чего движок может оценить конфиг как обычно.
+//! The pool found and its config are appended to the database (the pool is marked as untracked),
+//! after which the engine can score the config as usual.
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -19,23 +19,23 @@ use crate::store::now;
 pub const DBC_PROGRAM_ID: &str = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN";
 const TOKEN_PROGRAMS: &[&str] = &["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"];
 
-/// Пулы Meteora, куда токены попадают после запуска: из них берём адреса токенов.
-/// DAMM v2: Pool { pool_fees: PoolFeesStruct (160 байт), token_a_mint, token_b_mint, ... }.
-/// DLMM: LbPair, token_x_mint / token_y_mint — смещения посчитаны по IDL DLMM.
+/// Meteora pools that tokens move into after launch: token addresses are taken from them.
+/// DAMM v2: Pool { pool_fees: PoolFeesStruct (160 bytes), token_a_mint, token_b_mint, ... }.
+/// DLMM: LbPair, token_x_mint / token_y_mint — offsets computed from the DLMM IDL.
 const DAMM_V2_PROGRAM: &str = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG";
 const DAMM_V2_POOL_DISC: [u8; 8] = [241, 154, 109, 4, 17, 177, 109, 188];
 const DAMM_V2_MINTS: (usize, usize) = (8 + 160, 8 + 192);
 const DLMM_PROGRAM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 const DLMM_PAIR_DISC: [u8; 8] = [33, 11, 49, 98, 181, 101, 177, 13];
 const DLMM_MINTS: (usize, usize) = (88, 120);
-/// Типичные котируемые токены: в паре ищем «другой» токен.
+/// Common quote tokens: in a pair we look for the "other" token.
 const QUOTE_MINTS: &[&str] = &[
     "So11111111111111111111111111111111111111112",
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
 ];
 
-/// Программы других лаунчпадов: если токен создан ими, это не DBC.
+/// Programs of other launchpads: if a token was created by them, it is not DBC.
 const OTHER_LAUNCHPADS: &[(&str, &str)] = &[
     ("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P", "pump.fun"),
     ("LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj", "Raydium LaunchLab"),
@@ -46,13 +46,13 @@ const VIRTUAL_POOL_DISC: [u8; 8] = [213, 224, 5, 209, 98, 69, 119, 92];
 const TRANSFER_HOOK_POOL_DISC: [u8; 8] = [237, 219, 184, 23, 42, 189, 169, 35];
 const POOL_CONFIG_DISC: [u8; 8] = [26, 108, 14, 123, 116, 230, 129, 43];
 const CONFIG_WITH_TH_DISC: [u8; 8] = [0x28, 0xDC, 0xC2, 0xFB, 0x29, 0xC7, 0x7B, 0xFD];
-/// Anchor EVENT_IX_TAG (little-endian) и дискриминаторы EvtInitializePool (обычный и transfer-hook).
+/// Anchor EVENT_IX_TAG (little-endian) and the EvtInitializePool discriminators (regular and transfer-hook).
 const EVENT_IX_TAG: [u8; 8] = [0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x9a, 0x1d];
 const EVT_INIT: [u8; 8] = [228, 50, 246, 85, 203, 66, 134, 37];
 const EVT_INIT_TH: [u8; 8] = [213, 137, 164, 53, 193, 74, 15, 110];
 
-/// Смещения полей в данных аккаунта пула: 8 байт дискриминатора + смещение в PoolState
-/// (посчитаны offset_of! по коду программы DBC v0.2.1).
+/// Field offsets in the pool account data: 8 discriminator bytes + offset in PoolState
+/// (computed with offset_of! against the DBC program code v0.2.1).
 const OFF_CONFIG: usize = 8 + 64;
 const OFF_CREATOR: usize = 8 + 96;
 const OFF_BASE_MINT: usize = 8 + 128;
@@ -80,7 +80,7 @@ fn u64_at(d: &[u8], off: usize) -> Option<u64> {
     d.get(off..off + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
 }
 
-/// Разбор аккаунта пула DBC.
+/// Parsing a DBC pool account.
 pub fn parse_pool_account(pool: &str, data: &[u8]) -> Option<FoundPool> {
     let disc: [u8; 8] = data.get(..8)?.try_into().ok()?;
     if disc != VIRTUAL_POOL_DISC && disc != TRANSFER_HOOK_POOL_DISC {
@@ -99,7 +99,7 @@ pub fn parse_pool_account(pool: &str, data: &[u8]) -> Option<FoundPool> {
     })
 }
 
-/// Разбор события EvtInitializePool из данных внутренней инструкции.
+/// Parsing the EvtInitializePool event from inner instruction data.
 pub fn parse_init_event(data: &[u8]) -> Option<(String, String, String, String, u8, u64)> {
     if data.len() < 16 + 32 * 4 + 1 + 8 || data[..8] != EVENT_IX_TAG {
         return None;
@@ -112,15 +112,15 @@ pub fn parse_init_event(data: &[u8]) -> Option<(String, String, String, String, 
     Some((pk(&p[0..32]), pk(&p[32..64]), pk(&p[64..96]), pk(&p[96..128]), p[128], u64_at(p, 129)?))
 }
 
-/// Результат поиска адреса через RPC.
+/// Result of an address lookup over RPC.
 #[derive(Debug)]
 pub enum Lookup {
     Found(FoundPool),
-    /// адрес — пул Meteora DAMM v2 или DLMM; проверять нужно токен этого пула
+    /// the address is a Meteora DAMM v2 or DLMM pool; the token of this pool must be checked
     MeteoraPool { venue: &'static str, mint: String },
-    /// токен запущен на другом лаунчпаде; bool — вывод сделан только по окончанию адреса
+    /// the token was launched on another launchpad; bool — the conclusion is based only on the address suffix
     OtherLaunchpad(&'static str, bool),
-    /// это токен, но создание его пула не найдено в доступной истории узла
+    /// this is a token, but its pool creation was not found in the node's available history
     MintWithoutHistory,
     NotDbc,
 }
@@ -144,7 +144,7 @@ impl Rpc {
         self.call_at(&self.url, method, params).await
     }
 
-    /// Запросы, которым нужна полная история (подписи и транзакции прошлых дней).
+    /// Requests that need full history (signatures and transactions from past days).
     async fn call_history(&self, method: &str, params: Value) -> Result<Value> {
         self.call_at(&self.history_url, method, params).await
     }
@@ -169,7 +169,7 @@ impl Rpc {
         Err(last)
     }
 
-    /// (владелец, данные) аккаунта или None, если аккаунта нет.
+    /// (owner, data) of the account, or None if the account does not exist.
     pub async fn account(&self, addr: &str) -> Result<Option<(String, Vec<u8>)>> {
         let r = self.call("getAccountInfo", json!([addr, {"encoding": "base64", "commitment": "confirmed"}])).await?;
         let Some(v) = r.get("value").filter(|v| !v.is_null()) else { return Ok(None) };
@@ -178,7 +178,7 @@ impl Rpc {
         Ok(Some((owner, base64::engine::general_purpose::STANDARD.decode(data)?)))
     }
 
-    /// Пул по адресу токена: самая ранняя транзакция токена — создание пула.
+    /// Pool by token address: the token's earliest transaction is the pool creation.
     async fn pool_by_mint(&self, mint: &str) -> Result<MintOrigin> {
         let mut before: Option<String> = None;
         let mut oldest: Option<(String, u64, Option<i64>)> = None;
@@ -245,21 +245,21 @@ impl Rpc {
         Ok(MintOrigin::Unknown)
     }
 
-    /// Дешёвое определение адреса — один getAccountInfo, без поиска по истории.
-    /// Some — ответ известен (пул DBC, пул DAMM v2 / DLMM, не DBC);
-    /// None — это токен, и для поиска его пула нужна история транзакций (resolve).
+    /// Cheap address classification — a single getAccountInfo, no history search.
+    /// Some — the answer is known (DBC pool, DAMM v2 / DLMM pool, not DBC);
+    /// None — this is a token, and finding its pool needs transaction history (resolve).
     pub async fn resolve_cheap(&self, addr: &str) -> Result<Option<Lookup>> {
         let Some((owner, data)) = self.account(addr).await? else { return Ok(Some(Lookup::NotDbc)) };
         Ok(classify(addr, &owner, &data))
     }
 
-    /// Найти пул DBC по адресу пула или токена (или пула Meteora, где торгуется токен).
+    /// Find a DBC pool by pool or token address (or by a Meteora pool where the token trades).
     pub async fn resolve(&self, addr: &str) -> Result<Lookup> {
         let Some((owner, data)) = self.account(addr).await? else { return Ok(Lookup::NotDbc) };
         if let Some(l) = classify(addr, &owner, &data) {
             return Ok(l);
         }
-        // токен: самая ранняя транзакция через HISTORY_RPC_URL
+        // token: earliest transaction via HISTORY_RPC_URL
         Ok(match self.pool_by_mint(addr).await? {
             MintOrigin::Dbc(p) => Lookup::Found(p),
             MintOrigin::Launchpad(name) => Lookup::OtherLaunchpad(name, false),
@@ -271,7 +271,7 @@ impl Rpc {
     }
 }
 
-/// Что за адрес — по владельцу и данным аккаунта. None — токен (нужен поиск по истории).
+/// What the address is — by the account owner and data. None — a token (history search needed).
 fn classify(addr: &str, owner: &str, data: &[u8]) -> Option<Lookup> {
     if owner == DBC_PROGRAM_ID {
         return Some(parse_pool_account(addr, data).map(Lookup::Found).unwrap_or(Lookup::NotDbc));
@@ -302,7 +302,7 @@ enum MintOrigin {
     Unknown,
 }
 
-/// Токен пары, который не является котируемым (SOL, USDC, USDT).
+/// The token of the pair that is not a quote token (SOL, USDC, USDT).
 pub fn pair_mint(data: &[u8], disc: [u8; 8], (a, b): (usize, usize)) -> Option<String> {
     if data.get(..8)? != disc {
         return None;
@@ -312,7 +312,7 @@ pub fn pair_mint(data: &[u8], disc: [u8; 8], (a, b): (usize, usize)) -> Option<S
     if QUOTE_MINTS.contains(&ma.as_str()) { Some(mb) } else { Some(ma) }
 }
 
-/// Лаунчпады с «фирменным» окончанием адресов токенов.
+/// Launchpads with a "signature" token address suffix.
 pub fn launchpad_by_suffix(mint: &str) -> Option<&'static str> {
     if mint.ends_with("pump") {
         Some("pump.fun")
@@ -323,7 +323,7 @@ pub fn launchpad_by_suffix(mint: &str) -> Option<&'static str> {
     }
 }
 
-/// Дописать найденный пул и (если его ещё нет) сырые данные конфига в базу сборщика.
+/// Append the found pool and (if not there yet) the raw config data to the collector database.
 pub async fn store_found(db_path: &str, rpc: &Rpc, p: &FoundPool) -> Result<()> {
     let config_raw = {
         let conn = Connection::open(db_path)?;
@@ -354,7 +354,7 @@ pub async fn store_found(db_path: &str, rpc: &Rpc, p: &FoundPool) -> Result<()> 
                 params![p.config, key(8), key(40), raw, now()],
             )?;
         }
-        // пул найден по запросу: не отслеживается, сборщик его не опрашивает
+        // pool found on request: untracked, the collector does not poll it
         conn.execute(
             "INSERT OR IGNORE INTO pools
              (pool, config, creator, base_mint, pool_type, activation_point, transfer_hook,
@@ -407,7 +407,7 @@ mod tests {
         let wsol = bs58::decode(QUOTE_MINTS[0]).into_vec().unwrap();
         d[DAMM_V2_MINTS.1..DAMM_V2_MINTS.1 + 32].copy_from_slice(&wsol);
         assert_eq!(pair_mint(&d, DAMM_V2_POOL_DISC, DAMM_V2_MINTS), Some(pk(&[7u8; 32])));
-        // токен на месте b, SOL на месте a
+        // token in position b, SOL in position a
         d[DAMM_V2_MINTS.0..DAMM_V2_MINTS.0 + 32].copy_from_slice(&wsol);
         d[DAMM_V2_MINTS.1..DAMM_V2_MINTS.1 + 32].copy_from_slice(&[9u8; 32]);
         assert_eq!(pair_mint(&d, DAMM_V2_POOL_DISC, DAMM_V2_MINTS), Some(pk(&[9u8; 32])));

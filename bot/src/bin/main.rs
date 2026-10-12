@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
     let bot = Bot::new(cfg.telegram_token.clone());
     let state = Arc::new(State::new(cfg));
 
-    // первый пересчёт до приёма сообщений, чтобы бот сразу отвечал вердиктами
+    // first refresh before accepting messages, so the bot answers with verdicts right away
     if let Err(e) = state.refresh().await {
         tracing::warn!("initial refresh failed: {e:#}");
     }

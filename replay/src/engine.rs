@@ -1,9 +1,9 @@
-//! Движок повтора: прогоняет записанные свопы через математику самой программы DBC.
+//! Replay engine: runs the recorded swaps through the DBC program's own math.
 //!
-//! Повторяет порядок действий из `process_swap` программы:
+//! Follows the order of operations of the program's `process_swap`:
 //!   update_pre_swap -> get_swap_result_* -> apply_swap_result
-//! Поэтому при правильном конфиге и порядке сделок результат должен совпадать
-//! с событиями EvtSwap2 до последнего лампорта.
+//! So with the right config and trade order the result must match
+//! the EvtSwap2 events down to the last lamport.
 
 use anchor_lang::prelude::Pubkey;
 use anyhow::{anyhow, bail, Result};
@@ -18,7 +18,7 @@ use dynamic_bonding_curve::{
 };
 use std::str::FromStr;
 
-/// Параметры создания пула (из EvtInitializePool).
+/// Pool creation parameters (from EvtInitializePool).
 #[derive(Debug, Clone)]
 pub struct PoolInit {
     pub pool: String,
@@ -30,7 +30,7 @@ pub struct PoolInit {
     pub created_sig: String,
 }
 
-/// Своп, как он записан сборщиком (поля EvtSwap2 + контекст транзакции).
+/// A swap as recorded by the collector (EvtSwap2 fields + transaction context).
 #[derive(Debug, Clone)]
 pub struct RecordedSwap {
     pub signature: String,
@@ -54,7 +54,7 @@ fn pk(s: &str) -> Result<Pubkey> {
     Pubkey::from_str(s).map_err(|e| anyhow!("bad pubkey {s}: {e}"))
 }
 
-/// Состояние пула сразу после создания — так же, как его заполняет инструкция
+/// Pool state right after creation — the same way the instruction fills it
 /// initialize_virtual_pool_with_spl_token.
 pub fn initial_pool(config: &PoolConfig, init: &PoolInit) -> Result<PoolState> {
     let mut pool = PoolState::default();
@@ -63,7 +63,7 @@ pub fn initial_pool(config: &PoolConfig, init: &PoolInit) -> Result<PoolState> {
         pk(&init.config)?,
         pk(&init.creator)?,
         pk(&init.base_mint)?,
-        Pubkey::default(), // vault-адреса на математику не влияют
+        Pubkey::default(), // vault addresses do not affect the math
         Pubkey::default(),
         config.sqrt_start_price,
         init.pool_type,
@@ -74,10 +74,10 @@ pub fn initial_pool(config: &PoolConfig, init: &PoolInit) -> Result<PoolState> {
     Ok(pool)
 }
 
-/// Входные параметры одной сделки — то, что задаёт трейдер.
+/// Input parameters of a single trade — what the trader sets.
 #[derive(Debug, Clone, Copy)]
 pub struct SwapInput {
-    pub trade_direction: u8, // 0 = base->quote (продажа), 1 = quote->base (покупка)
+    pub trade_direction: u8, // 0 = base->quote (sell), 1 = quote->base (buy)
     pub swap_mode: u8,       // 0 exact in, 1 partial fill, 2 exact out
     pub amount_0: u64,
     pub has_referral: bool,
@@ -104,7 +104,7 @@ fn direction(d: u8) -> Result<TradeDirection> {
     TradeDirection::try_from(d).map_err(|_| anyhow!("bad trade_direction {d}"))
 }
 
-/// Считает результат сделки на `pool` и применяет его (мутирует `pool`).
+/// Computes the result of a trade on `pool` and applies it (mutates `pool`).
 pub fn simulate_swap(pool: &mut PoolState, config: &PoolConfig, input: &SwapInput) -> Result<SwapResult2> {
     if pool.is_curve_complete(config.migration_quote_threshold) {
         bail!("curve already complete");
@@ -136,7 +136,7 @@ pub fn simulate_swap(pool: &mut PoolState, config: &PoolConfig, input: &SwapInpu
     Ok(r)
 }
 
-/// Применяет к пулу *записанный* результат (для синхронизации состояния с onchain).
+/// Applies the *recorded* result to the pool (to keep the state in sync with onchain).
 fn apply_recorded(pool: &mut PoolState, config: &PoolConfig, s: &RecordedSwap) -> Result<()> {
     let dir = direction(s.trade_direction)?;
     pool.update_pre_swap(config, s.event_timestamp).map_err(anchor_err)?;
@@ -146,7 +146,7 @@ fn apply_recorded(pool: &mut PoolState, config: &PoolConfig, s: &RecordedSwap) -
         .map_err(anchor_err)
 }
 
-/// Список полей, в которых симуляция разошлась с записью.
+/// List of fields in which the simulation diverged from the record.
 pub fn diff(sim: &SwapResult2, rec: &SwapResult2) -> Vec<String> {
     let mut d = Vec::new();
     macro_rules! cmp {
@@ -181,12 +181,12 @@ impl Outcome {
     }
 }
 
-/// Проверочный повтор с исходным конфигом.
+/// Validation replay with the original config.
 ///
-/// Порядок сделок внутри одного слота RPC не сообщает, поэтому внутри слота
-/// жадно выбираем ту сделку, симуляция которой совпадает с записью.
-/// После каждой сделки состояние синхронизируется по записанному результату,
-/// так что одна ошибка не тянет за собой все следующие.
+/// RPC does not report the order of trades within one slot, so within a slot
+/// we greedily pick the trade whose simulation matches the record.
+/// After each trade the state is synced from the recorded result,
+/// so one error does not drag all the following ones along.
 pub fn validate(config: &PoolConfig, init: &PoolInit, mut swaps: Vec<RecordedSwap>) -> Result<Vec<Outcome>> {
     let mut pool = initial_pool(config, init)?;
     swaps.sort_by(|a, b| (a.slot, &a.signature, a.event_index).cmp(&(b.slot, &b.signature, b.event_index)));
@@ -199,7 +199,7 @@ pub fn validate(config: &PoolConfig, init: &PoolInit, mut swaps: Vec<RecordedSwa
         i += group.len();
 
         while !group.is_empty() {
-            // Ищем первую сделку группы, которая точно совпадает при текущем состоянии.
+            // Find the first trade of the group that matches exactly in the current state.
             let mut pick = None;
             for (k, s) in group.iter().enumerate() {
                 let mut trial = pool;
@@ -240,10 +240,10 @@ pub fn validate(config: &PoolConfig, init: &PoolInit, mut swaps: Vec<RecordedSwa
 mod tests {
     use super::*;
 
-    /// Самосогласованность: генерируем сделки симуляцией, перемешиваем их внутри
-    /// одного слота и проверяем, что validate восстанавливает порядок и всё совпадает.
-    /// Нужен файл конфига: DBC_FIXTURE_CONFIG=/путь/к/fee_in_quote_config.bin
-    /// (лежит в репозитории dynamic-bonding-curve: dynamic-bonding-curve-sdk/fixtures).
+    /// Self-consistency: generate trades by simulation, shuffle them within
+    /// one slot and check that validate restores the order and everything matches.
+    /// Needs a config file: DBC_FIXTURE_CONFIG=/path/to/fee_in_quote_config.bin
+    /// (found in the dynamic-bonding-curve repository: dynamic-bonding-curve-sdk/fixtures).
     #[test]
     fn replay_is_self_consistent() {
         let Ok(path) = std::env::var("DBC_FIXTURE_CONFIG") else {
@@ -266,7 +266,7 @@ mod tests {
         let activation_is_slot = config.activation_type == 0;
         let mut pool = initial_pool(&config, &init).unwrap();
 
-        // 6 покупок разного размера и 2 продажи, все в одном слоте
+        // 6 buys of different sizes and 2 sells, all in one slot
         let plan: [(u8, u64); 8] = [
             (1, 50_000_000), (1, 120_000_000), (1, 10_000_000), (0, 0),
             (1, 300_000_000), (1, 7_000_000), (0, 0), (1, 90_000_000),
@@ -287,7 +287,7 @@ mod tests {
             let r = simulate_swap(&mut pool, &config, &input).unwrap();
             if *dir == 1 { bought += r.output_amount } else { bought -= amount }
             recorded.push(RecordedSwap {
-                signature: format!("sig{}", 9 - n), // имена не совпадают с реальным порядком
+                signature: format!("sig{}", 9 - n), // names do not match the real order
                 event_index: 0,
                 slot: input.slot,
                 event_timestamp: input.timestamp,

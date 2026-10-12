@@ -1,4 +1,4 @@
-//! Тексты сообщений в MarkdownV2. Любой текст, кроме разметки, проходит через markdown::esc.
+//! Message texts in MarkdownV2. Any text other than markup goes through markdown::esc.
 
 use crate::markdown::{bold, code, esc, italic, link};
 use crate::store::{now, ConfigRisk, PoolInfo};
@@ -56,7 +56,7 @@ fn bullets(lines: &[String], max: usize) -> String {
     out
 }
 
-/// Тревожные признаки (с баллами, от весомых) и информационные строки (без баллов).
+/// Warning signs (with points, heaviest first) and informational lines (no points).
 fn risks_and_notes(r: &ConfigRisk) -> (Vec<String>, Vec<String>) {
     let mut all = r.scored_flags("capability_flags");
     all.extend(r.scored_flags("evidence_flags"));
@@ -66,7 +66,7 @@ fn risks_and_notes(r: &ConfigRisk) -> (Vec<String>, Vec<String>) {
     (risks.into_iter().map(|(_, t)| t).collect(), notes)
 }
 
-/// Положительные факты из конфига и наблюдений — то, что говорит в пользу запуска.
+/// Positive facts from the config and observations — what speaks in favour of the launch.
 fn positives(r: &ConfigRisk) -> Vec<String> {
     let mut out = Vec::new();
     let locked = r.u("locked_lp_pct");
@@ -89,7 +89,7 @@ fn positives(r: &ConfigRisk) -> Vec<String> {
     out
 }
 
-/// Блоки «почему / мелкие сигналы», «в пользу», «заметки» — сначала риски, потом положительное.
+/// Blocks "why / minor signals", "in its favour", "notes" — risks first, then positives.
 fn reasons(r: &ConfigRisk, max_risks: usize) -> String {
     let v = r.verdict();
     let (risks, notes) = risks_and_notes(r);
@@ -116,7 +116,7 @@ pub fn config_report(r: &ConfigRisk) -> String {
     let v = r.verdict();
     let mut s = format!("{} {}\n{}\n\n", emoji(&v), bold(&format!("{v} — {}", title(&v))), esc(&r.s("verdict_text")));
     s.push_str(&format!("Config {}\n", code(&r.s("config"))));
-    // вердикт относится к конфигу, а не к лаунчпаду: показываем, сколько конфигов у партнёра и сколько из них RED
+    // the verdict is about a config, not a launchpad: show how many configs the partner has and how many of them are RED
     let pc = r.u("partner_configs");
     if pc >= 2 {
         s.push_str(&format!(
@@ -175,18 +175,18 @@ pub fn pool_card(p: &PoolInfo, r: Option<&ConfigRisk>) -> String {
     let mut s = format!("{} {}\n\n", emoji(&v), bold(&format!("{v} — {t}")));
     s.push_str(&format!("Token {}\n", code(&p.base_mint)));
     s.push_str(&format!("Pool {}\n", code(&p.pool)));
-    // адрес создателя сокращён: полностью он виден в пуле на Solscan, но бот не выдаёт готовый список операторов
+    // the creator address is shortened: it is visible in full on the pool in Solscan, but the bot does not hand out a ready list of operators
     s.push_str(&format!("Creator {}\n", code(&short(&p.creator))));
     let instant = r.map(|r| r.0.get("instant_graduation").and_then(|v| v.as_bool()).unwrap_or(false)).unwrap_or(false);
     let age = p.created_time.map(|t| now() - t).unwrap_or(0);
-    // данные пула ещё не собраны: отслеживается, но есть только покупка создателя
+    // pool data not collected yet: it is tracked, but there is only the creator's buy
     let collecting = p.tracked && p.swaps.as_ref().map(|sw| sw.count <= 1).unwrap_or(true) && age > 300 && p.graduated_time.is_none();
     let grad = match p.graduated_time {
         Some(g) => format!("graduated {} after launch", dur(g - p.created_time.unwrap_or(g))),
         None if instant => "graduates instantly (migration threshold ≈ 0)".into(),
         None if !p.tracked => "graduation status not sampled".into(),
         None if collecting => "trades are still being collected".into(),
-        // нет записи о graduation — это не значит, что токен ещё на кривой
+        // no graduation record — this does not mean the token is still on the curve
         None => "graduation not recorded".into(),
     };
     s.push_str(&format!("{}\n\n", esc(&format!("Created {} · {}", ago(p.created_time), grad))));
@@ -221,16 +221,16 @@ fn dur(secs: i64) -> String {
     if s < 120 { format!("{s}s") } else if s < 7200 { format!("{}m", s / 60) } else { format!("{}h", s / 3600) }
 }
 
-/// Оператор: кластер конфигов из кэша (все записи с тем же номером кластера).
+/// Operator: a cluster of configs from the cache (all entries with the same cluster number).
 pub fn operator(r: &ConfigRisk, all: &HashMap<String, ConfigRisk>) -> String {
     let cluster = r.u("cluster");
     let size = r.u("cluster_size");
-    // кластер без синтетики — просто связанные конфиги, а не «оператор»
+    // a cluster without synthetic trading is just linked configs, not an "operator"
     let any_red = size > 1
         && all.values().any(|x| x.u("cluster") == cluster && matches!(x.verdict().as_str(), "RED" | "RED-LINK"));
     let heading = if size <= 1 || any_red { "Operator" } else { "Linked configs" };
     let mut s = format!("{}\n\n", bold(heading));
-    // адреса оператора сокращены (как в API без ключа): бот не выдаёт готовый список операторов
+    // operator addresses are shortened (as in the keyless API): the bot does not hand out a ready list of operators
     s.push_str(&format!("Top creator {}\n", code(&short(&r.s("top_creator")))));
     s.push_str(&format!("Fee claimer {}\n", code(&short(&r.s("fee_claimer")))));
     s.push_str(&format!(
@@ -361,7 +361,7 @@ pub fn how() -> String {
     s
 }
 
-/// Последние рискованные запуски: (pool, base_mint, created_time, verdict).
+/// Latest risky launches: (pool, base_mint, created_time, verdict).
 pub fn latest(rows: &[(String, String, Option<i64>, String)]) -> String {
     let mut s = format!("{}\n", bold("Latest risky launches"));
     if rows.is_empty() {

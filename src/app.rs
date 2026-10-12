@@ -1,4 +1,4 @@
-//! Общее состояние, правило выборки и запись событий транзакции в базу.
+//! Shared state, the sampling rule, and writing transaction events to the database.
 
 use crate::db::Db;
 use crate::events::{DbcEvent, InitPool};
@@ -9,31 +9,31 @@ use std::collections::HashSet;
 
 pub struct App {
     pub rpc: Rpc,
-    /// RPC для проверки graduation по аккаунтам (getMultipleAccounts): отдельный узел и лимит,
-    /// чтобы не отнимать запросы у загрузки свопов
+    /// RPC for checking graduation via accounts (getMultipleAccounts): a separate node and limit,
+    /// so it does not take requests away from loading swaps
     pub status_rpc: Rpc,
     pub db: Db,
-    /// websocket-адреса для обнаружения пулов (работают параллельно, дубликаты отсекаются)
+    /// websocket URLs for pool discovery (they run in parallel, duplicates are dropped)
     pub ws_urls: Vec<String>,
-    /// если от websocket нет сообщений столько секунд — переподключаемся
+    /// if there are no websocket messages for this many seconds, reconnect
     pub ws_stall_secs: u64,
-    /// адреса (создатели, получатели комиссий), чьи транзакции опрашиваются напрямую:
-    /// полное покрытие их запусков, их пулы отслеживаются всегда
+    /// addresses (creators, fee receivers) whose transactions are polled directly:
+    /// full coverage of their launches, their pools are always tracked
     pub watch: HashSet<String>,
     pub sample_every: u64,
     pub config_allowlist: HashSet<String>,
     pub track_secs: i64,
     pub poll_interval_secs: u64,
-    /// запасной RPC для транзакций, которые основной узел уже не отдаёт (обычно HISTORY_RPC_URL)
+    /// backup RPC for transactions the main node no longer serves (usually HISTORY_RPC_URL)
     pub backup_rpc: Option<Rpc>,
-    /// сколько транзакций в час можно взять из запасного RPC (бережём кредиты)
+    /// how many transactions per hour may be taken from the backup RPC (to save credits)
     pub backup_max_per_hour: u32,
-    /// (номер часа, сколько взято в этом часу)
+    /// (hour number, how many were taken in this hour)
     pub backup_used: std::sync::Mutex<(i64, u32)>,
 }
 
 impl App {
-    /// Резервирует одну транзакцию из часового бюджета запасного RPC.
+    /// Reserves one transaction from the backup RPC's hourly budget.
     pub fn take_backup_budget(&self) -> bool {
         let hour = chrono_hour();
         let mut g = self.backup_used.lock().unwrap();
@@ -47,9 +47,9 @@ impl App {
         true
     }
 
-    /// Отслеживаем пул, если его конфиг в allowlist или он попал в выборку.
-    /// Выборка детерминированная: первые 8 байт адреса пула (адреса равномерно
-    /// распределены), поэтому после перезапуска решения не меняются.
+    /// We track a pool if its config is in the allowlist or it falls into the sample.
+    /// The sample is deterministic: the first 8 bytes of the pool address (addresses are uniformly
+    /// distributed), so decisions do not change after a restart.
     pub fn should_track(&self, p: &InitPool) -> bool {
         if self.config_allowlist.contains(&p.config) || self.watch.contains(&p.creator) {
             return true;
@@ -65,9 +65,9 @@ impl App {
         h % self.sample_every == 0
     }
 
-    /// Записывает в базу всё полезное из разобранной транзакции.
+    /// Writes everything useful from a parsed transaction to the database.
     pub async fn ingest(&self, sig: &str, p: &ParsedTx) -> Result<()> {
-        // 1. Новые пулы (обычно приходят из обнаружения, но могут встретиться где угодно).
+        // 1. New pools (usually come from discovery, but can show up anywhere).
         for (_, ev) in &p.events {
             if let DbcEvent::InitializePool(ip) = ev {
                 let tracked = self.should_track(ip);
@@ -81,8 +81,8 @@ impl App {
                 }
             }
         }
-        // 2. Свопы и завершение кривой — только для отслеживаемых пулов.
-        //    Свопы из транзакции создания пула (первая покупка создателя) тоже попадают сюда.
+        // 2. Swaps and curve completion — only for tracked pools.
+        //    Swaps from the pool creation transaction (the creator's first buy) also end up here.
         for (idx, ev) in &p.events {
             match ev {
                 DbcEvent::Swap2(s) if self.db.is_tracked(&s.pool)? => {
@@ -100,7 +100,7 @@ impl App {
         Ok(())
     }
 
-    /// Один раз сохраняет сырые данные конфига (для будущего бэктеста).
+    /// Saves the raw config data once (for future backtesting).
     async fn ensure_config(&self, config: &str) {
         match self.db.config_known(config) {
             Ok(true) => return,

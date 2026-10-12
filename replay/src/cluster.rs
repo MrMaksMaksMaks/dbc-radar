@@ -1,26 +1,26 @@
-//! Группировка конфигов: кто за ними стоит и по какому шаблону они собраны.
+//! Grouping configs: who is behind them and which template they are built from.
 //!
-//! Два независимых признака:
-//!   * ШАБЛОН — отпечаток параметров конфига: все экономические поля PoolConfig,
-//!     кроме адресов (fee_claimer, leftover_receiver). Одинаковый отпечаток значит
-//!     «те же правила», даже если конфиги созданы разными адресами. Шаблоном могут
-//!     пользоваться и независимые люди (например, готовый инструмент запуска), поэтому
-//!     сам по себе он конфиги НЕ объединяет.
-//!   * ОПЕРАТОР — связи через адреса, которые трудно или дорого менять:
-//!     общий получатель комиссий, общий получатель остатка, общий создатель пулов,
-//!     общие кошельки-сателлиты (продают токены, которых не покупали в пуле).
-//!     Конфиги, связанные хотя бы одной такой связью, объединяются в кластер.
+//! Two independent signals:
+//!   * TEMPLATE — a fingerprint of the config parameters: all economic fields of PoolConfig
+//!     except addresses (fee_claimer, leftover_receiver). The same fingerprint means
+//!     "the same rules", even if the configs were created by different addresses. A template can
+//!     also be used by unrelated people (e.g. a ready-made launch tool), so
+//!     on its own it does NOT merge configs.
+//!   * OPERATOR — links through addresses that are hard or expensive to change:
+//!     a shared fee receiver, a shared leftover receiver, a shared pool creator,
+//!     shared satellite wallets (they sell tokens they never bought in the pool).
+//!     Configs linked by at least one such link are merged into a cluster.
 
 use anyhow::Result;
 use dynamic_bonding_curve::state::PoolConfig;
 use rusqlite::{params, Connection};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-/// Сколько общих сателлитов нужно, чтобы связать два конфига.
-/// Один-два общих адреса могут быть случайностью (общий торговый бот), три и больше — нет.
+/// How many shared satellites are needed to link two configs.
+/// One or two shared addresses can be a coincidence (a common trading bot); three or more cannot.
 pub const MIN_SHARED_SATELLITES: usize = 3;
 
-/// Адреса, которые никогда не связывают конфиги: сжигание и системная программа.
+/// Addresses that never link configs: burn and the system program.
 const NEVER_LINK: [&str; 2] = ["1nc1nerator11111111111111111111111111111111", "11111111111111111111111111111111"];
 
 #[derive(Debug, Clone)]
@@ -63,13 +63,13 @@ pub struct SharedAddress {
 #[derive(Debug, Clone)]
 pub struct Cluster {
     pub id: usize,
-    /// индексы в исходном списке ConfigInfo
+    /// indices in the source ConfigInfo list
     pub members: Vec<usize>,
     pub links: BTreeMap<LinkKind, usize>,
     pub shared: Vec<SharedAddress>,
 }
 
-/// FNV-1a 64: стабильный между запусками и версиями Rust, в отличие от DefaultHasher.
+/// FNV-1a 64: stable across runs and Rust versions, unlike DefaultHasher.
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in bytes {
@@ -79,8 +79,8 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
-/// Отпечаток параметров: тело PoolConfig без адресов fee_claimer и leftover_receiver,
-/// плюс признак наличия transfer hook (адрес хука в отпечаток не входит).
+/// Parameter fingerprint: the PoolConfig body without the fee_claimer and leftover_receiver addresses,
+/// plus a flag for whether there is a transfer hook (the hook address is not part of the fingerprint).
 pub fn template_of(raw: &[u8], has_hook: bool) -> String {
     let size = std::mem::size_of::<PoolConfig>();
     let mut body = raw[8..8 + size].to_vec();
@@ -103,8 +103,8 @@ pub fn load_info(conn: &Connection, config: &str, raw: &[u8], has_hook: bool) ->
     let creators = st
         .query_map(params![config], |r| r.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    // сателлиты — продавцы без покупки, но только в пулах, где они продали не больше токенов,
-    // чем купил создатель (иначе раздача не от оператора: например, снайпер раздал своим кошелькам)
+    // satellites are sellers without a buy, but only in pools where they sold no more tokens
+    // than the creator bought (otherwise the distribution is not from the operator: e.g. a sniper distributed to its own wallets)
     let mut st = conn.prepare_cached(
         "WITH fs AS (
              SELECT s.pool, s.fee_payer, s.included_fee_input_amount AS t
@@ -153,17 +153,17 @@ impl Dsu {
     }
 }
 
-/// Кластеры конфигов, связанных общими адресами. Возвращаются все, включая одиночные.
+/// Clusters of configs linked by shared addresses. All are returned, including singletons.
 ///
-/// `red[i]` — у конфига i синтетика по собственным доказательствам. Адрес платформы
-/// (лаунчпада) — встречается в `platform_min` и более конфигах, а синтетика наблюдается
-/// меньше чем в половине из них; такой адрес не связывает конфиги ни в какой роли:
-/// иначе все запуски платформы склеиваются в один «кластер оператора».
+/// `red[i]` — config i has synthetic trading by its own evidence. A platform (launchpad)
+/// address appears in `platform_min` or more configs, while synthetic trading is observed
+/// in fewer than half of them; such an address links configs in no role:
+/// otherwise all launches of the platform would be glued into one "operator cluster".
 pub fn clusters(infos: &[ConfigInfo], red: &[bool], platform_min: usize) -> Vec<Cluster> {
     let n = infos.len();
     let mut dsu = Dsu::new(n);
 
-    // адрес -> конфиги, где он встречается в данной роли
+    // address -> configs where it appears in the given role
     let mut by_addr: HashMap<(LinkKind, String), Vec<usize>> = HashMap::new();
     for (i, c) in infos.iter().enumerate() {
         if let Some(a) = &c.fee_claimer {
@@ -189,7 +189,7 @@ pub fn clusters(infos: &[ConfigInfo], red: &[bool], platform_min: usize) -> Vec<
         }
     }
 
-    // сателлиты: связываем пары конфигов с >= MIN_SHARED_SATELLITES общими кошельками
+    // satellites: link pairs of configs with >= MIN_SHARED_SATELLITES shared wallets
     let mut sat_configs: HashMap<&str, Vec<usize>> = HashMap::new();
     for (i, c) in infos.iter().enumerate() {
         for s in &c.satellites {
@@ -199,7 +199,7 @@ pub fn clusters(infos: &[ConfigInfo], red: &[bool], platform_min: usize) -> Vec<
     let mut pair_count: HashMap<(usize, usize), usize> = HashMap::new();
     for idx in sat_configs.values() {
         if idx.len() < 2 || idx.len() > 50 {
-            continue; // встречается в одном конфиге или слишком массовый адрес (вероятно, общий сервис)
+            continue; // appears in one config, or the address is too widespread (likely a shared service)
         }
         for a in 0..idx.len() {
             for b in a + 1..idx.len() {
@@ -257,7 +257,7 @@ pub fn clusters(infos: &[ConfigInfo], red: &[bool], platform_min: usize) -> Vec<
     for c in &mut out {
         c.shared.sort_by(|a, b| b.configs.cmp(&a.configs).then(a.kind.cmp(&b.kind)).then(a.address.cmp(&b.address)));
     }
-    // стабильные номера: крупные кластеры первыми
+    // stable numbers: large clusters first
     out.sort_by(|a, b| b.members.len().cmp(&a.members.len()).then(a.members[0].cmp(&b.members[0])));
     for (i, c) in out.iter_mut().enumerate() {
         c.id = i + 1;
@@ -283,17 +283,17 @@ mod tests {
     #[test]
     fn links_by_addresses_not_by_template() {
         let infos = vec![
-            // оператор X: новый конфиг на каждый запуск, общий leftover receiver
+            // operator X: a new config for every launch, a shared leftover receiver
             info("x1", "fx1", "LR_X", "T_RUG", &["cx1"], &["s1", "s2", "s3", "s4"]),
             info("x2", "fx2", "LR_X", "T_RUG", &["cx2"], &["s5"]),
-            // оператор Y: другие адреса, но те же сателлиты (>= 3 общих)
+            // operator Y: different addresses, but the same satellites (>= 3 shared)
             info("y1", "fy1", "LR_Y", "T_RUG", &["cy1"], &["s1", "s2", "s3"]),
-            // независимый пользователь того же шаблона — не должен склеиться
+            // an unrelated user of the same template — must not be glued in
             info("z1", "fz1", "LR_Z", "T_RUG", &["cz1"], &["s9"]),
-            // платформа: общий fee claimer на два конфига
+            // platform: a shared fee claimer for two configs
             info("p1", "FC_P", "lp1", "T_OK", &["u1"], &[]),
             info("p2", "FC_P", "lp2", "T_OK2", &["u2"], &[]),
-            // один общий сателлит — недостаточно для связи
+            // one shared satellite — not enough for a link
             info("w1", "fw1", "lw1", "T_X", &["cw1"], &["s1"]),
         ];
         let cl = clusters(&infos, &vec![false; infos.len()], 10);
@@ -315,17 +315,17 @@ mod tests {
     fn platform_and_burn_addresses_do_not_link() {
         let mut infos = Vec::new();
         let mut red = Vec::new();
-        // платформа: 12 конфигов с общим получателем и создателем пулов, синтетика в одном
+        // platform: 12 configs with a shared receiver and pool creator, synthetic trading in one
         for k in 0..12 {
             infos.push(info(&format!("p{k}"), "PLATFORM", "PLATFORM", "T", &["PLATFORM_CREATOR"], &[]));
             red.push(k == 0);
         }
-        // оператор: 12 конфигов с общим получателем, синтетика в 8 — это адрес оператора
+        // operator: 12 configs with a shared receiver, synthetic trading in 8 — this is an operator address
         for k in 0..12 {
             infos.push(info(&format!("o{k}"), "OPERATOR", &format!("lo{k}"), "T", &[format!("co{k}").as_str()], &[]));
             red.push(k < 8);
         }
-        // честные конфиги, сжигающие остаток: адрес сжигания не связывает
+        // honest configs that burn the leftover: the burn address does not link them
         infos.push(info("b1", "fb1", "1nc1nerator11111111111111111111111111111111", "T", &["cb1"], &[]));
         infos.push(info("b2", "fb2", "1nc1nerator11111111111111111111111111111111", "T", &["cb2"], &[]));
         red.extend([false, false]);
@@ -343,10 +343,10 @@ mod tests {
     fn template_ignores_addresses() {
         let size = std::mem::size_of::<PoolConfig>();
         let mut a = vec![0u8; 8 + size];
-        a[200] = 7; // какой-то экономический параметр
+        a[200] = 7; // some economic parameter
         let mut b = a.clone();
-        b[40..72].copy_from_slice(&[9u8; 32]); // другой fee_claimer
-        b[72..104].copy_from_slice(&[5u8; 32]); // другой leftover_receiver
+        b[40..72].copy_from_slice(&[9u8; 32]); // a different fee_claimer
+        b[72..104].copy_from_slice(&[5u8; 32]); // a different leftover_receiver
         assert_eq!(template_of(&a, false), template_of(&b, false));
         let mut c = a.clone();
         c[200] = 8;

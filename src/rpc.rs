@@ -1,5 +1,5 @@
-//! Тонкий JSON-RPC клиент поверх reqwest с ограничением частоты и повторами.
-//! Сознательно без solana-client: меньше зависимостей и быстрее сборка.
+//! Thin JSON-RPC client on top of reqwest with rate limiting and retries.
+//! Deliberately without solana-client: fewer dependencies and a faster build.
 
 use anyhow::{anyhow, bail, Result};
 use base64::Engine;
@@ -14,7 +14,7 @@ pub struct Rpc {
     limiter: Mutex<Interval>,
 }
 
-#[allow(dead_code)] // slot/block_time пригодятся для отладки и бэкфилла
+#[allow(dead_code)] // slot/block_time will be useful for debugging and backfill
 #[derive(Debug, Clone)]
 pub struct SigInfo {
     pub signature: String,
@@ -50,8 +50,8 @@ impl Rpc {
                     } else {
                         let v: Value = resp.json().await?;
                         if let Some(err) = v.get("error") {
-                            // -32005/-32007 и подобные у провайдеров обычно временные,
-                            // остальные ошибки отдаём наверх сразу.
+                            // -32005/-32007 and similar provider errors are usually temporary,
+                            // other errors are returned upward right away.
                             let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
                             if matches!(code, -32005 | -32007 | -32004 | -32603) {
                                 last_err = anyhow!("{method}: rpc error {err}");
@@ -72,7 +72,7 @@ impl Rpc {
         Err(last_err)
     }
 
-    /// Подписи по адресу, новые первыми (так отдаёт RPC).
+    /// Signatures for an address, newest first (as the RPC returns them).
     pub async fn get_signatures(
         &self,
         address: &str,
@@ -102,7 +102,7 @@ impl Rpc {
             .collect())
     }
 
-    /// Транзакция в json-кодировке. Ok(None), если RPC её ещё не отдаёт.
+    /// Transaction in json encoding. Ok(None) if the RPC does not serve it yet.
     pub async fn get_transaction(&self, signature: &str) -> Result<Option<Value>> {
         let res = self
             .call(
@@ -117,9 +117,9 @@ impl Rpc {
         Ok(if res.is_null() { None } else { Some(res) })
     }
 
-    /// Аккаунты пачкой (до 100 адресов): для каждого (владелец, данные) или None, если аккаунта нет.
-    /// `slice` = (offset, length) — читать только часть данных (меньше ответ; публичные узлы
-    /// отклоняют слишком большие запросы).
+    /// Accounts in a batch (up to 100 addresses): for each, (owner, data) or None if the account does not exist.
+    /// `slice` = (offset, length) — read only part of the data (smaller response; public nodes
+    /// reject requests that are too large).
     pub async fn get_multiple_accounts(
         &self,
         keys: &[String],
@@ -146,7 +146,7 @@ impl Rpc {
             .collect()
     }
 
-    /// Сырые данные аккаунта (base64 -> bytes).
+    /// Raw account data (base64 -> bytes).
     pub async fn get_account_data(&self, pubkey: &str) -> Result<Option<Vec<u8>>> {
         let res = self
             .call(

@@ -1,10 +1,10 @@
-//! Инлайн-клавиатуры. Данные кнопок (callback data, до 64 байт):
-//!   p:<pool>    — карточка пула
-//!   c:<config>  — отчёт по конфигу
-//!   cp:<pool>   — отчёт по конфигу пула (с кнопкой «назад» к пулу)
-//!   o:<config>  — оператор (кластер)
-//!   r:<config>  — последние запуски конфига
-//!   op:<pool>   — оператор пула (с кнопкой «назад» к пулу)
+//! Inline keyboards. Button data (callback data, up to 64 bytes):
+//!   p:<pool>    — pool card
+//!   c:<config>  — config report
+//!   cp:<pool>   — config report for a pool (with a "back" button to the pool)
+//!   o:<config>  — operator (cluster)
+//!   r:<config>  — latest launches of a config
+//!   op:<pool>   — operator of a pool (with a "back" button to the pool)
 //!   stats | how | home | latest
 
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
@@ -24,7 +24,7 @@ pub fn home() -> InlineKeyboardMarkup {
     ])
 }
 
-/// Список последних запусков: по кнопке на каждый, плюс обновить и меню.
+/// List of latest launches: one button per launch, plus refresh and menu.
 pub fn latest(items: &[(String, String)]) -> InlineKeyboardMarkup {
     let mut rows: Vec<Vec<InlineKeyboardButton>> = items.iter().map(|(label, pool)| vec![cb(label, format!("p:{pool}"))]).collect();
     rows.push(vec![cb("🔁 Refresh", "latest".into()), cb("« Menu", "home".into())]);
@@ -46,7 +46,7 @@ pub fn pool(pool: &str) -> InlineKeyboardMarkup {
     ])
 }
 
-/// `back` — callback data для кнопки «назад» (например, к карточке пула).
+/// `back` — callback data for the "back" button (e.g. to the pool card).
 pub fn config(config: &str, back: Option<String>) -> InlineKeyboardMarkup {
     let mut rows = vec![vec![cb("🧭 Operator", format!("o:{config}")), cb("🕒 Recent launches", format!("r:{config}"))]];
     let mut last = Vec::new();
@@ -66,7 +66,7 @@ pub fn back_to(data: String) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![vec![cb("« Back", data)]])
 }
 
-/// Для канала оповещений: только ссылки (callback-кнопки в канале меняли бы сообщение для всех).
+/// For the alerts channel: links only (callback buttons in a channel would change the message for everyone).
 pub fn open_in_bot(bot_username: &str, config: &str) -> InlineKeyboardMarkup {
     let mut row = Vec::new();
     if let Some(b) = url("🔎 Open in bot", format!("https://t.me/{bot_username}?start=c_{config}")) {

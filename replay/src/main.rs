@@ -1,22 +1,22 @@
-//! dbc-replay: проверочный и контрфактический повтор свопов одного пула.
+//! dbc-replay: validation and counterfactual replay of one pool's swaps.
 //!
-//! Проверка (симуляция против записанных EvtSwap2):
+//! Validation (simulation against the recorded EvtSwap2):
 //!   dbc-replay ../dbc.sqlite 28VR
 //!
-//! Контрфакт (те же сделки при другом планировщике комиссий):
+//! Counterfactual (the same trades under a different fee scheduler):
 //!   dbc-replay ../dbc.sqlite 28VR --cf
 //!   dbc-replay ../dbc.sqlite 28VR --cf-mode exp --cf-start 50 --cf-end 0.25 \
 //!       --cf-periods 20 --cf-period-len 1 --early 10
 //!
-//! Флаги:
-//!   --cf                 включить контрфакт со значениями по умолчанию
-//!   --cf-mode exp|linear тип планировщика (по умолчанию exp)
-//!   --cf-start <pct>     стартовая комиссия, % (по умолчанию 50)
-//!   --cf-end <pct>       конечная комиссия, % (по умолчанию — минимальная комиссия исходного конфига)
-//!   --cf-periods <n>     число периодов снижения (по умолчанию 20)
-//!   --cf-period-len <n>  длина периода в слотах или секундах, как activation_type конфига (по умолчанию 1)
-//!   --early <n>          "ранние" кошельки: первая сделка в пределах n слотов/секунд от активации (по умолчанию 10)
-//!   --verbose            всегда печатать таблицу проверки
+//! Flags:
+//!   --cf                 enable the counterfactual with default values
+//!   --cf-mode exp|linear scheduler type (default exp)
+//!   --cf-start <pct>     starting fee, % (default 50)
+//!   --cf-end <pct>       final fee, % (default — the source config's minimum fee)
+//!   --cf-periods <n>     number of decay periods (default 20)
+//!   --cf-period-len <n>  period length in slots or seconds, as the config's activation_type (default 1)
+//!   --early <n>          "early" wallets: first trade within n slots/seconds of activation (default 10)
+//!   --verbose            always print the validation table
 
 mod cf;
 mod data;
@@ -153,7 +153,7 @@ fn print_config(c: &PoolConfig, quote_mint: &Option<String>) {
     );
 }
 
-/// Доля комиссии в сделке, %.
+/// Fee share of a trade, %.
 fn fee_pct(c: &PoolConfig, s: &engine::RecordedSwap, r: &SwapResult2) -> f64 {
     let dir = if s.trade_direction == 1 { TradeDirection::QuoteToBase } else { TradeDirection::BaseToQuote };
     let fees = (r.trading_fee + r.protocol_fee + r.referral_fee) as f64;
@@ -165,7 +165,7 @@ fn fee_pct(c: &PoolConfig, s: &engine::RecordedSwap, r: &SwapResult2) -> f64 {
 }
 
 fn main() -> Result<()> {
-    // пороги вердиктов не требуют базы
+    // verdict thresholds do not need the database
     if std::env::args().nth(1).as_deref() == Some("thresholds") || std::env::args().nth(2).as_deref() == Some("thresholds") {
         println!("{:<34} {:>8} {:>8}  meaning", "variable", "value", "default");
         for (k, v, d, what) in risk::thresholds().rows() {
@@ -193,7 +193,7 @@ fn main() -> Result<()> {
     print_config(&config, &quote_mint);
     println!();
 
-    // 1. Проверка движка на исходном конфиге (заодно восстанавливает порядок сделок).
+    // 1. Engine check on the source config (also restores the trade order).
     let outcomes = engine::validate(&config, &init, swaps)?;
     let matched = outcomes.iter().filter(|o| o.matched()).count();
     if !args.wants_cf() || args.has("--verbose") || matched != outcomes.len() {
@@ -225,7 +225,7 @@ fn main() -> Result<()> {
         println!("NOTE: quote is not SOL; amounts below assume 9 quote decimals");
     }
 
-    // 2. Контрфактический конфиг.
+    // 2. Counterfactual config.
     let schedule = cf::FeeSchedule {
         mode: match args.flags.get("--cf-mode").map(String::as_str).unwrap_or("exp") {
             "exp" | "exponential" => 1,
@@ -245,7 +245,7 @@ fn main() -> Result<()> {
     let real = cf::run(&config, start_pool, &ordered, &init.created_sig)?;
     let alt = cf::run(&cf_config, start_pool, &ordered, &init.created_sig)?;
 
-    // Базовый прогон по модели должен совпадать с реальностью.
+    // The baseline model run must match reality.
     let baseline_ok = real.trades.iter().zip(&ordered).all(|(t, s)| matches!(t, cf::TradeStatus::Done(r) if *r == s.result));
     println!(
         "baseline (original config, same trade model) reproduces recorded trades: {}",
@@ -293,7 +293,7 @@ fn main() -> Result<()> {
     }
     println!();
 
-    // Кошельки.
+    // Wallets.
     println!(
         "{:<8}  {:<5}  {:>12}  {:>12}  {:>14}  {:>14}",
         "wallet", "early", "real PnL SOL", "cf PnL SOL", "real tok left", "cf tok left"
@@ -364,11 +364,11 @@ struct RiskRow {
     facts: risk::ConfigFacts,
     beh: risk::Behavior,
     rep: risk::Report,
-    /// номер кластера операторов и его размер
+    /// operator cluster number and its size
     cluster: usize,
     cluster_size: usize,
     template: String,
-    /// конфигов у того же партнёра (fee_claimer) в базе и сколько из них RED / RED-LINK
+    /// configs of the same partner (fee_claimer) in the database, and how many of them are RED / RED-LINK
     partner_configs: usize,
     partner_red_configs: usize,
 }
@@ -396,15 +396,15 @@ fn leftover_pct(f: &risk::ConfigFacts) -> f64 {
     if f.total_supply > 0 { 100.0 * f.leftover_to_receiver as f64 / f.total_supply as f64 } else { 0.0 }
 }
 
-/// Оценка всех конфигов базы + кластеры операторов + перенос риска по связям.
-/// Кластеры строятся по ВСЕЙ базе, даже если запрошен один конфиг: иначе связи не видны.
+/// Scoring of all configs in the database + operator clusters + risk propagation over links.
+/// Clusters are built over the WHOLE database, even if one config is requested: otherwise the links are not visible.
 fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
     let mut st = conn.prepare("SELECT config, COUNT(*) n FROM pools GROUP BY config ORDER BY n DESC")?;
     let configs: Vec<String> = st
         .query_map([], |r| r.get(0))?
         .collect::<std::result::Result<_, _>>()?;
 
-    // Проход 1: читаем конфиги и адреса.
+    // Pass 1: read configs and addresses.
     let mut loaded = Vec::new();
     let mut infos = Vec::new();
     let mut skipped = 0;
@@ -427,7 +427,7 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
         }
     }
 
-    // Проход 2: оценка с учётом того, какие адреса — общие адреса платформ.
+    // Pass 2: scoring, taking into account which addresses are shared platform addresses.
     let widx = farm::wallet_index(conn)?;
     let mut rows = Vec::new();
     for ((cfg, config, hook), info) in loaded.into_iter().zip(&infos) {
@@ -458,7 +458,7 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
         });
     }
 
-    // вердикты по собственным доказательствам конфигов — чтобы отличить адреса платформ
+    // verdicts from the configs' own evidence — to tell platform addresses apart
     let own_red: Vec<bool> = rows.iter().map(|r| r.rep.verdict == risk::Verdict::Synthetic).collect();
     let clusters = cluster::clusters(&infos, &own_red, risk::PLATFORM_MIN_CONFIGS);
     for c in &clusters {
@@ -468,17 +468,17 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
         }
     }
 
-    // Ферма на уровне оператора: если оператор держит одну ферму на нескольких конфигах,
-    // специфичность кошельков считается к кластеру. Только для кластеров операторов
-    // (есть конфиг, позволяющий забрать ликвидность и сбросить остаток) и не для платформ
-    // (общий получатель остатка в 10+ конфигах), иначе постоянные трейдеры площадки
-    // ошибочно попали бы в «ферму».
+    // Operator-level farm: if the operator runs one farm across several configs,
+    // wallet specificity is computed against the cluster. Only for operator clusters
+    // (there is a config that allows taking the liquidity and dumping the leftover) and not for platforms
+    // (a shared leftover receiver in 10+ configs), otherwise the venue's regular traders
+    // would wrongly end up in the "farm".
     for c in &clusters {
         if !operator_scope(c, &rows) {
             continue;
         }
         let scope: Vec<String> = c.members.iter().map(|&m| rows[m].config.clone()).collect();
-        // сделки кластера загружаются один раз, метрики считаются для каждого конфига по ним
+        // the cluster's trades are loaded once, and the metrics for each config are computed from them
         let data = farm::load_scope(conn, &scope)?;
         for &m in &c.members {
             let fs = farm::analyze_loaded(&data, &[rows[m].config.clone()], &widx, 0);
@@ -488,9 +488,9 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
         }
     }
 
-    // Защита конфигов платформ (risk::platform_guard): конфиг лаунчпада со многими создателями
-    // получает RED только при прямом доказательстве. Понижённый конфиг не переносит риск по связям
-    // и сам не получает RED-LINK: его создатели — пользователи платформы.
+    // Platform config guard (risk::platform_guard): a launchpad config with many creators
+    // gets RED only with direct evidence. A downgraded config does not propagate risk over links
+    // and does not get RED-LINK itself: its creators are users of the platform.
     let mut partner_stats: HashMap<String, (usize, usize)> = HashMap::new();
     for (i, info) in infos.iter().enumerate() {
         if let Some(a) = &info.fee_claimer {
@@ -508,13 +508,13 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
         }
     }
 
-    // Конфиги с наблюдаемыми инсайдерскими продажами (вердикт по собственным доказательствам).
+    // Configs with observed insider selling (verdict by their own evidence).
     let red: Vec<bool> = rows.iter().map(|r| r.rep.verdict == risk::Verdict::Synthetic).collect();
 
-    // Общий адрес (получатель комиссий или остатка) во многих конфигах — адрес платформы
-    // (лаунчпада), если синтетика наблюдается меньше чем в половине его конфигов.
-    // Иначе это адрес оператора, даже если конфигов у него много. Один оператор на лаунчпаде
-    // не должен окрашивать честные конфиги той же платформы.
+    // A shared address (fee or leftover receiver) in many configs is a platform (launchpad)
+    // address if synthetic trading is observed in fewer than half of its configs.
+    // Otherwise it is an operator address, even if it has many configs. One operator on a launchpad
+    // must not taint the honest configs of the same platform.
     let mut addr_stats: HashMap<(cluster::LinkKind, String), (usize, usize)> = HashMap::new();
     for (i, info) in infos.iter().enumerate() {
         for (kind, addr) in [
@@ -532,17 +532,17 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
         let (total, reds) = addr_stats.get(&(kind, addr.to_string())).copied().unwrap_or((1, 0));
         total >= risk::PLATFORM_MIN_CONFIGS && reds * 2 < total
     };
-    // Для переноса риска общий получатель комиссий или остатка — адрес оператора, только если
-    // синтетика наблюдается не меньше чем в половине его конфигов, при любом их числе.
-    // Небольшой лаунчпад (5 конфигов, синтетика в 2) не окрашивает свои честные конфиги;
-    // новый конфиг оператора с адресом его RED-конфига (1 из 2) связь сохраняет.
+    // For risk propagation, a shared fee or leftover receiver is an operator address only if
+    // synthetic trading is observed in at least half of its configs, whatever their number.
+    // A small launchpad (5 configs, synthetic trading in 2) does not taint its honest configs;
+    // an operator's new config with the address of its RED config (1 of 2) keeps the link.
     let is_operator_address = |kind: cluster::LinkKind, addr: &str| -> bool {
         let (total, reds) = addr_stats.get(&(kind, addr.to_string())).copied().unwrap_or((1, 0));
         reds * 2 >= total
     };
 
-    // Получатель остатка, общий для многих конфигов, по умолчанию считается адресом платформы
-    // (хранение у платформы безопаснее); если это адрес оператора — снимаем эту скидку.
+    // A leftover receiver shared by many configs is treated as a platform address by default
+    // (custody by the platform is safer); if it is an operator address, we remove that discount.
     for (i, r) in rows.iter_mut().enumerate() {
         if r.facts.leftover_receiver_configs < risk::PLATFORM_MIN_CONFIGS {
             continue;
@@ -555,14 +555,14 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
         }
     }
 
-    // Перенос риска — только по ПРЯМЫМ связям конфига с RED-конфигами (без цепочек через кластер):
-    //   * общие создатели пулов, на которых приходится >= 30% пулов конфига, общий адрес оператора
-    //     (синтетика у большинства его конфигов) — RED-LINK; меньшая доля общих создателей
-    //     (например, конфиг лаунчпада, где пара пользователей запускала и на RED-конфиге) — инфо;
-    //   * только общие сателлиты (>= MIN_SHARED_SATELLITES) — RED-LINK, если сам конфиг рискованный
-    //     (capability >= 50), иначе информационный флаг;
-    //   * только общий адрес платформы — информационный флаг.
-    // пулов у каждого создателя в каждом конфиге и всего пулов конфига: вес связи через общих создателей
+    // Risk propagation — only over DIRECT links of a config to RED configs (no chains through the cluster):
+    //   * shared pool creators accounting for >= 30% of the config's pools, a shared operator address
+    //     (synthetic trading in most of its configs) — RED-LINK; a smaller share of shared creators
+    //     (e.g. a launchpad config where a couple of users also launched on a RED config) — info;
+    //   * shared satellites only (>= MIN_SHARED_SATELLITES) — RED-LINK if the config itself is risky
+    //     (capability >= 50), otherwise an informational flag;
+    //   * a shared platform address only — an informational flag.
+    // pools per creator in each config and the config's total pools: the weight of a link through shared creators
     let mut creator_pools: HashMap<(String, String), usize> = HashMap::new();
     let mut config_pools: HashMap<String, usize> = HashMap::new();
     {
@@ -688,7 +688,7 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
                     ),
                 });
             } else if let Some(n) = red_templates.get(&r.template) {
-                // совпадение параметров — не доказательство: по умолчанию только пояснение (0 баллов)
+                // matching parameters are not evidence: by default only an explanation (0 points)
                 r.rep.evidence_flags.push(risk::Flag {
                     points: risk::thresholds().template_points,
                     text: format!("identical parameter template to {n} config(s) where trading is dominated by creator-linked wallets"),
@@ -700,7 +700,7 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
         }
     }
 
-    // сколько конфигов у партнёра и сколько из них в итоге RED / RED-LINK — для пояснения в карточке
+    // how many configs the partner has and how many of them ended up RED / RED-LINK — for the explanation on the card
     let mut by_partner: HashMap<String, (usize, usize)> = HashMap::new();
     for (i, info) in infos.iter().enumerate() {
         if let Some(a) = &info.fee_claimer {
@@ -718,8 +718,8 @@ fn analyze(conn: &rusqlite::Connection) -> Result<Analysis> {
     Ok(Analysis { rows, infos, clusters, skipped })
 }
 
-/// Кластер оператора, а не платформы: несколько конфигов, хотя бы один позволяет забрать
-/// ликвидность и сбросить остаток, и ни у одного остаток не хранит адрес платформы.
+/// An operator cluster, not a platform one: several configs, at least one allows taking
+/// the liquidity and dumping the leftover, and none keeps the leftover at a platform address.
 fn operator_scope(c: &cluster::Cluster, rows: &[RiskRow]) -> bool {
     c.members.len() > 1
         && c.members.iter().any(|&m| rows[m].rep.capability >= 50)
@@ -736,13 +736,13 @@ fn sort_rows(rows: &mut [&RiskRow]) {
     });
 }
 
-/// Поля для исследований: что внешние кошельки оставили на кривой, по активным пулам конфига.
+/// Research fields: what external wallets left on the curve, over the config's active pools.
 fn research_json(r: &RiskRow, since: i64) -> String {
     let Some(fs) = r.beh.farm.as_ref() else { return ",\"research\":null".to_string() };
-    // оператор: что связанные кошельки вывели с кривой сверх вложенного, отдельно по
-    // невыпустившимся пулам (там это чистое изъятие у остальных) и по выпустившимся
-    // --research-since: только пулы, созданные не раньше этого времени (например, после того как
-    // сборщик начал записывать фактического плательщика и мастер-кошельки стали распознаваться)
+    // operator: what the linked wallets took off the curve beyond what they put in, separately for
+    // non-graduated pools (there it is a pure extraction from everyone else) and for graduated ones
+    // --research-since: only pools created no earlier than this time (e.g. after
+    // the collector started recording the actual payer and master wallets became detectable)
     let recent = |x: &&(f64, bool, i64)| x.2 >= since;
     let op_open: Vec<f64> = fs.operator_net_per_pool.iter().filter(recent).filter(|x| !x.1).map(|x| x.0).collect();
     let op_grad: Vec<f64> = fs.operator_net_per_pool.iter().filter(recent).filter(|x| x.1).map(|x| x.0).collect();
@@ -810,8 +810,8 @@ fn run_risk(conn: &rusqlite::Connection, args: &Args) -> Result<()> {
     sort_rows(&mut rows);
 
     if args.has("--json") {
-        // --research: поля для исследований (деньги внешних по пулам); бот их не запрашивает,
-        // поэтому в карточки и API они не попадают
+        // --research: research fields (externals' money per pool); the bot does not request them,
+        // so they do not reach the cards or the API
         let research = args.has("--research");
         let research_since: i64 = args.flags.get("--research-since").and_then(|v| v.parse().ok()).unwrap_or(0);
         let opt = |v: Option<f64>| v.map(|x| format!("{x:.4}")).unwrap_or_else(|| "null".into());
@@ -1133,8 +1133,8 @@ fn run_templates(conn: &rusqlite::Connection, _args: &Args) -> Result<()> {
 
 // ---------------------------------------------------------------- impact
 
-/// `impact` (алиас `damage`): синтетичность активности и результат внешних участников
-/// по операторам с вердиктом RED / RED-LINK.
+/// `impact` (alias `damage`): how synthetic the activity is and the result of external participants
+/// for operators with a RED / RED-LINK verdict.
 fn run_damage(conn: &rusqlite::Connection, args: &Args) -> Result<()> {
     let a = analyze(conn)?;
     let since_hours: f64 = args.num("--since-hours", 0.0)?;
@@ -1184,7 +1184,7 @@ fn run_damage(conn: &rusqlite::Connection, args: &Args) -> Result<()> {
         } else {
             Vec::new()
         };
-        // сделки кластера загружаются один раз на кластер
+        // the cluster's trades are loaded once per cluster
         let data = if scope.is_empty() { None } else { Some(farm::load_scope(conn, &scope)?) };
         for &i in &c.members {
             let r = &a.rows[i];
@@ -1266,12 +1266,12 @@ fn run_damage(conn: &rusqlite::Connection, args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// Конфиги-ловушки для снайперов (исследование, в бот и README не выводится):
-/// высокая стартовая комиссия, почти вся торговая комиссия одному адресу и
-/// дополнительный доход тому же организатору (миграционная комиссия или leftover).
-/// Выводит по пулу на строку, от старых к новым.
-///   уровень A: старт ≥ 70%, один получатель ≥ 80% комиссии, доп. доход ≥ 10%, конфиг одноразовый
-///   уровень B: старт ≥ --min-start (50%) и один получатель ≥ 80% комиссии
+/// Sniper-trap configs (research, not shown in the bot or the README):
+/// a high starting fee, almost all of the trading fee to one address, and
+/// extra income for the same organizer (migration fee or leftover).
+/// Prints one pool per line, oldest first.
+///   level A: start ≥ 70%, one receiver ≥ 80% of the fee, extra income ≥ 10%, single-use config
+///   level B: start ≥ --min-start (50%) and one receiver ≥ 80% of the fee
 fn run_fee_traps(conn: &rusqlite::Connection, args: &Args) -> Result<()> {
     let since_hours: f64 = args.num("--since-hours", 72.0)?;
     let min_start: f64 = args.num("--min-start", 50.0)?;
@@ -1395,7 +1395,7 @@ fn run_fee_traps(conn: &rusqlite::Connection, args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// Дата по числу дней от 1970-01-01 (алгоритм Хиннанта).
+/// Date from the number of days since 1970-01-01 (Hinnant's algorithm).
 fn civil(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
@@ -1414,8 +1414,8 @@ mod fee_traps_tests {
     use anchor_lang::prelude::Pubkey;
     use std::str::FromStr;
 
-    /// Конфиг с налогом на снайперов (75% → 3% за 180 с, 100% партнёру, миграционная комиссия 99%)
-    /// попадает в уровень A; обычный конфиг с плоской комиссией 1% не выводится.
+    /// A sniper-fee config (75% → 3% over 180 s, 100% to the partner, 99% migration fee)
+    /// falls into level A; a regular config with a flat 1% fee is not printed.
     #[test]
     fn fee_traps_lists_sniper_tax_config() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();

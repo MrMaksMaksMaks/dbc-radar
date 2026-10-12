@@ -1,5 +1,5 @@
-//! Разбор транзакции из getTransaction (encoding = "json"):
-//! находим внутренние инструкции, адресованные программе DBC, и декодируем события.
+//! Parsing a transaction from getTransaction (encoding = "json"):
+//! we find inner instructions addressed to the DBC program and decode the events.
 
 use crate::events::{decode_event_ix, DbcEvent, DBC_PROGRAM_ID};
 use anyhow::{Context, Result};
@@ -7,8 +7,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 const WSOL: &str = "So11111111111111111111111111111111111111112";
-/// Владельцы хранилищ пулов (pool authority PDA программ DBC и DAMM v2) и сами программы:
-/// это пул, а не участник сделки.
+/// Pool vault owners (pool authority PDAs of the DBC and DAMM v2 programs) and the programs themselves:
+/// this is the pool, not a trade participant.
 const NOT_PARTICIPANTS: [&str; 4] = [
     "FhVo3mqL8PW5pH5U2CN4XE33DokiyZnUwuGpH2hmHLuM",
     "HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC",
@@ -21,23 +21,23 @@ const NOT_PARTICIPANTS: [&str; 4] = [
 pub struct ParsedTx {
     pub slot: u64,
     pub block_time: Option<i64>,
-    /// Плательщик комиссии (первый подписант). Для анализа трейдеров это
-    /// приближение: при оплате через релейер реальный владелец может отличаться.
+    /// Fee payer (the first signer). For trader analysis this is
+    /// an approximation: when paying through a relayer, the real owner may differ.
     pub fee_payer: String,
     pub failed: bool,
-    /// (порядковый номер события DBC в транзакции, событие)
+    /// (index of the DBC event within the transaction, the event)
     pub events: Vec<(u32, DbcEvent)>,
-    /// Изменение SOL по владельцам (лампорты всех аккаунтов; токен-аккаунты, включая
-    /// обёрнутый SOL, относятся к их владельцу). Хранилища пулов исключены.
+    /// SOL change per owner (lamports of all accounts; token accounts, including
+    /// wrapped SOL, are attributed to their owner). Pool vaults are excluded.
     pub sol_by_owner: HashMap<String, i64>,
-    /// Изменение токенов (кроме обёрнутого SOL) по владельцам, в единицах токена.
+    /// Token change (except wrapped SOL) per owner, in token units.
     pub tok_by_owner: HashMap<String, i128>,
 }
 
 impl ParsedTx {
-    /// Фактические стороны сделки: (чьи SOL — плательщик при покупке, получатель при
-    /// продаже; кто получил или отдал токены). Подписант транзакции может быть другим
-    /// (прокси, релейер). Если транзакция содержит несколько свопов, стороны общие для всех.
+    /// The actual trade parties: (whose SOL — the payer on a buy, the receiver on a
+    /// sell; who received or gave away the tokens). The transaction signer may be someone else
+    /// (a proxy, a relayer). If a transaction contains several swaps, the parties are shared by all.
     pub fn trade_owners(&self, buy: bool) -> (Option<String>, Option<String>) {
         let sol = self
             .sol_by_owner
@@ -55,7 +55,7 @@ impl ParsedTx {
     }
 }
 
-/// Изменения балансов по владельцам из meta транзакции.
+/// Balance changes per owner from the transaction meta.
 fn owner_deltas(meta: &Value, keys: &[String]) -> (HashMap<String, i64>, HashMap<String, i128>) {
     let mut owner_of: HashMap<u64, String> = HashMap::new();
     let mut tok: HashMap<String, i128> = HashMap::new();
@@ -67,7 +67,7 @@ fn owner_deltas(meta: &Value, keys: &[String]) -> (HashMap<String, i64>, HashMap
             };
             owner_of.insert(idx, owner.to_string());
             if e.get("mint").and_then(Value::as_str) == Some(WSOL) {
-                continue; // обёрнутый SOL учитывается в лампортах аккаунта
+                continue; // wrapped SOL is counted in the account's lamports
             }
             let amount: i128 = e.pointer("/uiTokenAmount/amount").and_then(Value::as_str).and_then(|a| a.parse().ok()).unwrap_or(0);
             *tok.entry(owner.to_string()).or_default() += sign * amount;
@@ -106,7 +106,7 @@ pub fn parse_tx(tx: &Value) -> Result<ParsedTx> {
     let meta = tx.get("meta").context("no meta")?;
     let failed = !meta.get("err").map(Value::is_null).unwrap_or(true);
 
-    // Порядок ключей для v0-транзакций: статические, затем загруженные writable, затем readonly.
+    // Key order for v0 transactions: static, then loaded writable, then readonly.
     let mut keys = str_array(tx.pointer("/transaction/message/accountKeys"));
     keys.extend(str_array(meta.pointer("/loadedAddresses/writable")));
     keys.extend(str_array(meta.pointer("/loadedAddresses/readonly")));
@@ -155,7 +155,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Прокси P подписывает покупку, SOL платит мастер M из обёрнутого SOL, токены получает P.
+    /// Proxy P signs a buy, master M pays the SOL from wrapped SOL, P receives the tokens.
     #[test]
     fn finds_payer_behind_proxy() {
         let tx = json!({
